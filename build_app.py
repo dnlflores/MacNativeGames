@@ -1090,10 +1090,11 @@ def step_code_botw(tree, botw, game, keys, env, logs):
     report_path.write_text(json.dumps(report, indent=2) + '\n')
 
 
-def step_data_botw(tree, botw, game, keys, logs, *, shared_fonts=None, update=None):
+def step_data_botw(tree, botw, game, keys, logs, *, shared_fonts=None, update=None, dlc=()):
     """The base + 1.6.0 RomFS merged from the card image (games/botw/scripts/extract_romfs.py, hactool BKTR), the two
-    add-on content volumes (extract_aoc_romfs.py), and the shared fonts: this card's system update partition is empty, so
-    they come from --shared-fonts or from a previous build in the work folder."""
+    add-on content volumes (extract_aoc_romfs.py: from the card image, or from the separate DLC NSPs given with --dlc),
+    and the shared fonts: this card's system update partition is empty, so they come from --shared-fonts or from a
+    previous build in the work folder."""
     version, expected = 'botw160', BOTW160
     py = tree / '.venv/bin/python'
     folder = tree / f'extracted/{version}/romfs'
@@ -1117,8 +1118,8 @@ def step_data_botw(tree, botw, game, keys, logs, *, shared_fonts=None, update=No
         check('1.6.0 RomFS', report['romfs_sha256'], expected['romfs']['sha256'])
         check('1.6.0 RomFS size', report['romfs_size'], expected['romfs']['size'])
     aoc = tree / f'extracted/{version}/aoc'
-    if update:
-        # A separate base/update install has no expansion pass. Drop cached card DLC
+    if update and not dlc:
+        # A separate base/update install without --dlc has no expansion pass. Drop cached card DLC
         # and its generated configuration before rebuilding in a reused work folder.
         if aoc.exists():
             shutil.rmtree(aoc)
@@ -1137,7 +1138,7 @@ def step_data_botw(tree, botw, game, keys, logs, *, shared_fonts=None, update=No
             if aoc.exists():
                 shutil.rmtree(aoc)
             say('2/4 data: extracting the add-on content (the expansion pass, 1.4 GB)')
-            run([py, botw / 'scripts/extract_aoc_romfs.py', game, '--keys', keys, '--hactool', hactool, '--output', aoc,
+            run([py, botw / 'scripts/extract_aoc_romfs.py', *(dlc or [game]), '--keys', keys, '--hactool', hactool, '--output', aoc,
                  '--expected', botw / 'assets/expected-v1.6.0.json'], logs / 'botw-aoc.log', cwd=tree)
             for i, want in expected['aoc'].items():
                 report = json.loads((aoc / i / 'index.json').read_text())
@@ -1185,6 +1186,8 @@ def parse_args(argv):
                                  epilog='example: python3 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys')
     ap.add_argument('game', type=Path, help='the game file (.xci or .nsp), base game 1.0.0')
     ap.add_argument('--update', type=Path, help='separate supported cumulative update NSP/NSZ; outputs the same single app')
+    ap.add_argument('--dlc', type=Path, action='append', default=[], help='Breath of the Wild: a separate add-on content NSP '
+                    '(give it once per file, both 01007EF00011F001 and 01007EF00011F002); without it a separate install has no DLC')
     ap.add_argument('--platform', choices=('macos','ios'), default='macos', help='build a macOS app (default) or unsigned iPhone/iPad IPA')
     ap.add_argument('-k', '--keys', type=Path, required=True, help='your prod.keys')
     ap.add_argument('-o', '--out', type=Path, help=f'the app or IPA to write (default depends on --platform; next to the game file)')
@@ -1212,6 +1215,10 @@ def main(argv):
     if kind not in ('xci', 'nsp'):
         raise BuildError('the base game must be an uncompressed XCI or NSP; NSZ is supported for update packages')
     update = args.update.expanduser().resolve() if args.update else None
+    dlc = [p.expanduser().resolve() for p in args.dlc]
+    for p in dlc:
+        if not p.is_file() or input_kind(p) != 'nsp':
+            raise BuildError(f'--dlc must be an add-on content NSP: {p}')
     if update and (not update.is_file() or input_kind(update) not in ('nsp', 'nsz')):
         raise BuildError('--update must be a separate cumulative NSP or NSZ')
     version = 'v0'
@@ -1258,7 +1265,7 @@ def main(argv):
         if update:
             update = prepare_update_container(tree, update, keys, logs)
         step_code_botw(tree, botw, update or game, keys, env, logs)
-        step_data_botw(tree, botw, game, keys, logs, shared_fonts=shared_fonts, update=update)
+        step_data_botw(tree, botw, game, keys, logs, shared_fonts=shared_fonts, update=update, dlc=dlc)
         step_shaders_botw(tree, botw, logs)
         step_shader_libs(tree, logs, version='botw160')
         step_binary(tree, game, keys, {**env, 'SHADER_LIST': str(BOTW_LIST)}, logs, version='botw160', title='01007ef00011e000')
@@ -1284,6 +1291,8 @@ def main(argv):
         say('Open it from Finder. The first start verifies the game data and any installed add-on content and keeps a record; '
             'saves, the shader cache and the log go to ~/Library/Application Support/MacNativeGames/BotW and ~/Library/Logs/MacNativeGames/botw.log.')
         return
+    if dlc:
+        raise BuildError('--dlc is for Breath of the Wild add-on content; this game file is Tears of the Kingdom')
     work_volume=existing_volume_path(work.parent if work.parent.exists() else game.parent)
     output_volume=existing_volume_path(out.parent if out.parent.exists() else game.parent)
     free=shutil.disk_usage(work_volume).free/2**30

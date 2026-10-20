@@ -73,6 +73,35 @@ class BotwImport(unittest.TestCase):
         self.base.write_bytes(partition([('base.nca', program(False, False)), ('update.nca', program(True, False))]))
         self.assertEqual(module.programs(self.base, load_keys(self.keys))[2], 1)
 
+    def aoc_module(self):
+        spec = importlib.util.spec_from_file_location('botw_aoc', BOTW / 'extract_aoc_romfs.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def dlc_nsps(self, tickets=True, titles=(0x01007EF00011F001, 0x01007EF00011F002)):
+        files = []
+        for n, title in enumerate(titles, 1):
+            path = self.root / f'dlc{n}.nsp'
+            path.write_bytes(partition([(f'aoc{n}.nca', nca(True, title=title, content=5))] +
+                                       ([(f'aoc{n}.tik', ticket())] if tickets else [])))
+            files.append(path)
+        return files
+
+    def test_separate_dlc_nsps(self):
+        dlc = self.dlc_nsps()
+        found, tickets = self.aoc_module().aoc_ncas(dlc, load_keys(self.keys))
+        self.assertEqual({i: [r['source'] for r in found[i]] for i in found}, {1: [dlc[0]], 2: [dlc[1]]})
+        self.assertEqual(len(tickets), 1)
+
+    def test_separate_dlc_without_ticket_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'Missing common ticket'):
+            self.aoc_module().aoc_ncas(self.dlc_nsps(tickets=False), load_keys(self.keys))
+
+    def test_separate_dlc_needs_both_packs(self):
+        with self.assertRaisesRegex(ValueError, r'Expected add-on content 1 and 2 .* found \[1\]'):
+            self.aoc_module().aoc_ncas(self.dlc_nsps(titles=(0x01007EF00011F001,)), load_keys(self.keys))
+
     def test_conflicting_tickets_rejected(self):
         spec = importlib.util.spec_from_file_location('botw_romfs', BOTW / 'extract_romfs.py')
         module = importlib.util.module_from_spec(spec)
