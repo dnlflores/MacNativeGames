@@ -133,10 +133,17 @@ static uint32_t vi_vsync(void *ev,void *display){
  if(!ev||display!=&displayIdentity)return 0xf601;hle_bind_system_event(ev,1);
  pthread_mutex_lock(&vsyncLock);if(vsyncCount>=16)runtime_fail("VI display event limit");vsyncEvents[vsyncCount++]=ev;pthread_mutex_unlock(&vsyncLock);return 0;
 }
+#ifdef GAME_BOTW
+static uint32_t vi_scaling_mode(void *layer,int mode){(void)layer;(void)mode;return 0;}
+#endif
 void *runtime_front_override(const char *name){
  static const struct{const char *name;void *fn;} entries[]={
  {"_ZN2nn2vi10InitializeEv",vi_initialize},{"_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE",vi_open},
  {"_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE",vi_layer},{"_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE",vi_window},
- {"_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE",vi_vsync}};
+ {"_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE",vi_vsync}
+#ifdef GAME_BOTW
+ ,{"_ZN2nn2vi19SetLayerScalingModeEPNS0_5LayerENS0_11ScalingModeE",vi_scaling_mode}   /* SDK 7: the window scales itself (frontend.m) */
+#endif
+ };
  for(unsigned i=0;i<sizeof(entries)/sizeof(*entries);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;return NULL;
 }

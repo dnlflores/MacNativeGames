@@ -122,6 +122,10 @@ static void audio_observe(void) {
     setenv("TOTK_ROMFS_PATCHES_OUT",[res stringByAppendingPathComponent:@"romfs-patches-out"].fileSystemRepresentation,1);
     setenv("TOTK_SHARED_FONTS",[res stringByAppendingPathComponent:@"shared-fonts"].fileSystemRepresentation,1);
     setenv("TOTK_SHADER_SEED_DIR",[res stringByAppendingPathComponent:@"shader-seed"].fileSystemRepresentation,1);
+    /* Breath of the Wild's add-on content volumes (ios/tools/build_ipa.py: GameData/aoc/<index>); their verification
+       record goes to TOTK_ROMFS_PROOF_DIR like the RomFS's, since the bundle is read-only. */
+    NSString *aoc = [res stringByAppendingPathComponent:@"aoc"];
+    if ([NSFileManager.defaultManager fileExistsAtPath:aoc]) setenv("TOTK_AOC",aoc.fileSystemRepresentation,1);
     /* One folder per translation chain, as on the Mac: the runtime refuses translations of another chain, and the seed
        import keeps files that are already there. Builds before the v5 chain (2026-10-20) kept them directly in
        shader-cache; those, and other chains' folders, are only cache and are removed in the background. */

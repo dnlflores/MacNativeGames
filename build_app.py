@@ -7,7 +7,9 @@ Supported: TOTK base 1.0.0 (0100F2C0115B6000), XCI or NSP; optional --update wit
 Also Breath of the Wild 1.6.0 (01007EF00011E000) as one card image holding the base game, the update and the add-on
 content (games/botw): it needs --shared-fonts (the six .bfttf files a Tears of the Kingdom build extracted into its work
 folder, extracted/firmware/shared-fonts); its startup shaders come from its game data and its own shared shader list
-(games/botw/assets/shader_list.tsv). The game is recognised by the title IDs in the file, never by the file name.
+(games/botw/assets/shader_list.tsv); --platform ios makes an unsigned iPad/iPhone IPA of it too (its code patches are
+applied on the Mac and embedded, as for Tears of the Kingdom 1.4.3). The game is recognised by the title IDs in the file,
+never by the file name.
 NSPs need common tickets (unless rights-free) and a separate shared-font source. iOS builds are unsigned IPAs for sideloading and require Xcode 26+, xcodegen, CMake, and network access to build device libraries.
 Nothing from the game is in this repository; everything is made from your files on your Mac. Key values are never printed.
 
@@ -1179,7 +1181,7 @@ def step_shaders_botw(tree, botw, logs):
 
 
 def parse_args(argv):
-    ap = argparse.ArgumentParser(description='Build a native Mac app or unsigned iPhone/iPad IPA from TOTK base 1.0.0 (XCI/NSP), optionally with the separate 1.1.2, 1.2.1 or 1.4.3 update; or a Mac app from Breath of the Wild base + separate 1.6.0 update, or a combined card image.',
+    ap = argparse.ArgumentParser(description='Build a native Mac app or unsigned iPhone/iPad IPA from TOTK base 1.0.0 (XCI/NSP), optionally with the separate 1.1.2, 1.2.1 or 1.4.3 update; or a Mac app or unsigned iPhone/iPad IPA from Breath of the Wild base + separate 1.6.0 update, or a combined card image.',
                                  epilog='example: python3 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys')
     ap.add_argument('game', type=Path, help='the game file (.xci or .nsp), base game 1.0.0')
     ap.add_argument('--update', type=Path, help='separate supported cumulative update NSP/NSZ; outputs the same single app')
@@ -1237,17 +1239,18 @@ def main(argv):
     if which == 'botw':
         if fresh_work and not args.work:   # BotW_build next to the game file, not TOTK_build
             shutil.rmtree(work)
-        if args.platform == 'ios':
-            raise BuildError('Breath of the Wild has no iPhone / iPad build yet: build the Mac app (leave out --platform ios)')
+        ios = args.platform == 'ios'
         if not args.work:
             work = game.parent / 'BotW_build'
             logs = work / 'logs'
             tree = prepare_work(work, py, logs)
         if not args.out:
-            out = game.parent / f'{APPS["botw"][0]}.app'
-        if shutil.disk_usage(existing_volume_path(work.parent if work.parent.exists() else game.parent)).free / 2**30 < 22 and \
-                not (work / 'totk/extracted/botw160/romfs/romfs.bin').exists():
-            raise BuildError('needs about 22 GB free for the work folder (the app itself is an APFS clone of it when on the same volume)')
+            out = game.parent / f'{APPS["botw"][0]}.{"ipa" if ios else "app"}'
+        # The IPA is a real 17 GB archive (zip), not an APFS clone of the work folder like the Mac app.
+        need_gb = (22 + 18 if ios else 22) if not (work / 'totk/extracted/botw160/romfs/romfs.bin').exists() else (18 if ios else 0)
+        if shutil.disk_usage(existing_volume_path(work.parent if work.parent.exists() else game.parent)).free / 2**30 < need_gb:
+            raise BuildError(f'needs about {need_gb} GB free for the work folder' + (' and the IPA archive' if ios else
+                             ' (the app itself is an APFS clone of it when on the same volume)'))
         if args.shader_cache:
             say('--shader-cache is no longer needed: the startup shaders come from the game data and the shared shader list (games/botw/assets/shader_list.tsv)')
         botw = work / 'botw'
@@ -1260,6 +1263,15 @@ def main(argv):
         step_shader_libs(tree, logs, version='botw160')
         step_binary(tree, game, keys, {**env, 'SHADER_LIST': str(BOTW_LIST)}, logs, version='botw160', title='01007ef00011e000')
         say(f'4/4 app: assembling {out}')
+        if ios:
+            # No shader-contribution reminder: that Mac agent (ios/tools/shader_contrib_watch.py) knows only Tears of the Kingdom.
+            run([py, 'ios/tools/build_ipa.py', '--tree', tree, '--out', out, '--version', 'botw160', '--logs', logs,
+                 '--app-name', APPS['botw'][0], '--bundle-id', APPS['botw'][1], '--shader-list', BOTW_LIST],
+                logs / 'build-ipa.log', cwd=tree, env=env)
+            say(f'done in {(time.time() - t0) / 60:.0f} min: {out}')
+            say('Install the unsigned IPA with a sideloading tool (iOS/iPadOS 26, a supported game controller). The first start '
+                'verifies the game data and any add-on content; saves and the shader cache stay in the app\'s Documents.')
+            return
         step_app(tree, out, logs, version='botw160', game='botw')
         run([LSREGISTER, '-f', out], logs / 'register-app.log')
         say('4/4 app: macOS checks the new app once (a few minutes for the 16 GB bundle)')

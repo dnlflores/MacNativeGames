@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an unsigned, sideloadable iPhone/iPad IPA from a prepared TOTK work tree."""
+"""Build an unsigned, sideloadable iPhone/iPad IPA from a prepared TOTK (or Breath of the Wild, --version botw160) work tree."""
 import argparse, json, os, shutil, subprocess, sys
 from pathlib import Path
 from compile_seed import METAL_FLAGS
@@ -30,31 +30,40 @@ def copy_tree(src,dst):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--tree',type=Path,required=True);p.add_argument('--out',type=Path,required=True)
-    p.add_argument('--version',choices=['v0','v112','v121','v143'],required=True);p.add_argument('--logs',type=Path,required=True)
+    p.add_argument('--version',choices=['v0','v112','v121','v143','botw160'],required=True);p.add_argument('--logs',type=Path,required=True)
     p.add_argument('--app-name',default='Tears of the Kingdom');p.add_argument('--bundle-id',default='org.macnativegames.totk')
+    p.add_argument('--shader-list',type=Path,help="the game's shared shader list (default: Tears of the Kingdom's)")
     a=p.parse_args(); tree=a.tree.resolve(); ios=tree/'ios';gen=ios/'Gen';logs=a.logs.resolve(); out=a.out.resolve()
+    botw=a.version=="botw160"
     if out.suffix.lower()!='.ipa': raise RuntimeError('iOS output path must end in .ipa')
     env=dict(os.environ,DEVELOPER_DIR=developer_dir())
     sdk=subprocess.check_output(['xcrun','--sdk','iphoneos','--show-sdk-path'],env=env,text=True).strip()
     subprocess.run(['xcodebuild','-version'],env=env,check=True,stdout=subprocess.DEVNULL)
     if not shutil.which('xcodegen'): raise RuntimeError('install xcodegen: brew install xcodegen')
     gen.mkdir(parents=True,exist_ok=True)
-    version_dir=tree/'build'/({'v0':'','v112':'v112','v121':'v121','v143':'v143'}[a.version])
+    version_dir=tree/'build'/({'v0':'','v112':'v112','v121':'v121','v143':'v143','botw160':'botw160'}[a.version])
     if a.version=='v0': version_dir=tree/'build'
-    for name in ('runtime_tables.h','romfs_config.h'):
+    for name in ('runtime_tables.h','romfs_config.h')+(('aoc_config.h',) if botw else ()):
         clone(version_dir/name,gen/name)
     clone(tree/'build/shared_fonts_config.h',gen/'shared_fonts_config.h')
     # Export the final code after all verified runtime patches have been applied, then embed it in executable segments.
     host=tree/('build/totk-native' if a.version=='v0' else f'build/totk-native-{a.version}')
     rewritten=tree/f'rewritten/{a.version}'; modules=gen/'modules';modules.mkdir(exist_ok=True)
     e=dict(env,TOTK_EXPORT_IOS=str(modules))
+    # The device only checks the patched words (game_patches_botw.c CODE_PATCHED_AT_BUILD): export with every code switch
+    # at its default, whatever this shell has set, and without the Mac-only brk diagnostics.
+    if botw:
+        for name in ('TOTK_REALTIME','TOTK_PAD_REPEAT','TOTK_RENDER_RES','TOTK_EXCL_ACQUIRE','TOTK_JQ_CHECK','TOTK_PAD_LOG'): e.pop(name,None)
     run([host,rewritten,'export-ios'],tree,logs/'export-ios.log',e)
     flags=subprocess.check_output([sys.executable,ios/'tools/gen_embed.py',rewritten,gen/'embed.S','--text-dir',modules,'main','subsdk0','sdk'],text=True,env=env).strip()
     # The app's sources use version-specific patch and generated runtime tables.
     project=(ios/'project.yml').read_text()
-    if a.version=='v143': project=project.replace('          - loader.c','          - loader.c\n          - game_patches.c')
+    if botw:   # game_patches_botw.c replaces both of Tears of the Kingdom's (games/totk/Makefile runtime-botw160)
+        project=project.replace('          - game_patches_botw.c','          - game_patches.c\n          - game_patches_v143.c')
+        project=project.replace('-I../build\n','-I../build -DGAME_BOTW=1 -DGAME_BOTW160=1\n')
+    elif a.version=='v143': project=project.replace('          - loader.c','          - loader.c\n          - game_patches.c')
     else: project=project.replace('          - loader.c','          - loader.c\n          - game_patches_v143.c')
-    if a.version!='v0': project=project.replace('-I../build\n','-I../build -DTOTK_GAME_'+a.version.upper()+'=1\n')
+    if a.version!='v0' and not botw: project=project.replace('-I../build\n','-I../build -DTOTK_GAME_'+a.version.upper()+'=1\n')
     (ios/'project.generated.yml').write_text(project)
     # Build device dependencies separately: Homebrew's Mac archives cannot be linked into an iOS application.
     deps=tree/'build/ios-deps'
@@ -109,12 +118,17 @@ def main():
     copy_tree(romfs,res/'romfs')
     for src,dst in [(tree/f'extracted/{a.version}/romfs-patches',res/'romfs-patches'),
                     (tree/f'extracted/{a.version}/romfs-patches-out',res/'romfs-patches-out'),
-                    (tree/'extracted/firmware/shared-fonts',res/'shared-fonts')]: copy_tree(src,dst)
+                    (tree/'extracted/firmware/shared-fonts',res/'shared-fonts')]:
+        if botw and not src.is_dir(): continue   # Breath of the Wild has no RomFS overlays (build_app.py step_app)
+        copy_tree(src,dst)
+    if botw:   # The verified add-on content volumes that were extracted (main.m points TOTK_AOC here)
+        for vol in sorted((tree/f'extracted/{a.version}/aoc').glob('*/index.json')):
+            for name in ('romfs.bin','runtime-index.bin'): clone(vol.parent/name,res/'aoc'/vol.parent.name/name)
     copy_tree(seed,res/'shader-seed')
     # The first frame waits only for the title screen's shaders (pso_title.tsv); the runtime looks for the list next to
     # DM_NVN_SHMAP, which is in shader-seed on iOS. Without it the first frame waits for the whole warm-up.
     # Exported from the one shared shader list (games/totk/assets/shader_list.tsv, docs/shader-list.md).
-    run([sys.executable,tree/'scripts/shader_list.py','export',tree/'assets/shader_list.tsv',logs/'pso_manifest.tsv',
+    run([sys.executable,tree/'scripts/shader_list.py','export',a.shader_list or tree/'assets/shader_list.tsv',logs/'pso_manifest.tsv',
          res/'shader-seed/pso_title.tsv'],tree,logs/'shader-list.log',env)
     # Keep the player's first install self-contained; the app stores saves and writable shader cache in Documents.
     payload=tree/'build/ios-payload';shutil.rmtree(payload,ignore_errors=True);(payload/'Payload').mkdir(parents=True)

@@ -200,7 +200,9 @@ static void map_module(Module *m,const char *dir) {
 }
 /* TOTK_EXPORT_IOS=<dir>: after the game patches, write each module's text [0, page_up(TEXT_END)) for ios/tools/gen_embed.py.
    Relocations never reach the text (they start at DATA_OFF), so the exported bytes differ from the verified image only at
-   the patch sites; the count is printed and checked by the generator. */
+   the patch sites; the count is printed and checked by the generator. The patch area [PATCH_OFF, page_up(file size)) is
+   written too (<name>.x1.bin) when a game patch changed it (Breath of the Wild's exclusive loads with acquire); otherwise
+   the generator embeds it from the verified image, as before. */
 static void export_ios_text(const char *rewritten,const char *out) {
  for(unsigned i=0;i<NM;i++){Module *m=&modules[i];char path[4096];size_t n=page_up(m->text_end);
   need(snprintf(path,sizeof path,"%s/%s.patched.bin",rewritten,m->name)<(int)sizeof path,"image path");
@@ -208,7 +210,15 @@ static void export_ios_text(const char *rewritten,const char *out) {
   unsigned diff=0;for(size_t k=0;k<n;k+=4)if(memcmp(orig+k,m->base+k,4))diff++;free(orig);
   need(snprintf(path,sizeof path,"%s/%s.x0.bin",out,m->name)<(int)sizeof path,"export path");
   f=fopen(path,"wb");need(f&&fwrite(m->base,1,n,f)==n&&fclose(f)==0,"write exported text");
-  printf("%s text_bytes=%zu patched_words=%u\n",m->name,n,diff);}
+  printf("%s text_bytes=%zu patched_words=%u\n",m->name,n,diff);
+  size_t lo=m->patch_off,hi=page_up(m->file_size);need(lo<=hi&&hi<=m->size,"patch area layout");
+  need(snprintf(path,sizeof path,"%s/%s.patched.bin",rewritten,m->name)<(int)sizeof path,"image path");
+  f=fopen(path,"rb");need(f!=NULL,"open patched module");orig=calloc(1,hi-lo);need(orig!=NULL,"patch area buffer");
+  need(fseeko(f,(off_t)lo,SEEK_SET)==0&&fread(orig,1,m->file_size-lo,f)==m->file_size-lo,"read original patch area");fclose(f);
+  unsigned xdiff=0;for(size_t k=0;k<hi-lo;k+=4)if(memcmp(orig+k,m->base+lo+k,4))xdiff++;free(orig);
+  need(snprintf(path,sizeof path,"%s/%s.x1.bin",out,m->name)<(int)sizeof path,"export path");unlink(path);
+  if(xdiff){f=fopen(path,"wb");need(f&&fwrite(m->base+lo,1,hi-lo,f)==hi-lo&&fclose(f)==0,"write exported patch area");}
+  printf("%s patch_area_bytes=%zu patched_words=%u\n",m->name,hi-lo,xdiff);}
 }
 #endif
 static void relocate(Module *m) {

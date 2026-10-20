@@ -23,6 +23,8 @@ for name in names:
     data = image.read_bytes(); text_end = int(hdr['TEXT_END'], 16); patch = int(hdr['PATCH_OFF'], 16)
     text_image = (text_dir / f'{name}.x0.bin') if text_dir else image
     text_data = text_image.read_bytes() if text_dir else data
+    # The patch area as exported when a game patch changed it (loader.c export_ios_text); else the verified image's.
+    area_image = (text_dir / f'{name}.x1.bin') if text_dir and (text_dir / f'{name}.x1.bin').is_file() else None
     key = int(hdr['KEY_PAGE_OFF'], 16); size = int(hdr.get('FILE_IMAGE_LEN', f'{len(data):x}'), 16)
     x0, x1 = up(text_end), up(len(data))
     if len(text_data) != x0:
@@ -41,6 +43,12 @@ for name in names:
         section_image = text_image if sect == f'__TOTKX,__{name}x0' else image
         if sect == f'__TOTKX,__{name}x0': chunk_source = text_data
         else: chunk_source = data
+        if sect == f'__TOTKX,__{name}x1' and area_image:
+            area = area_image.read_bytes()
+            if len(area) != hi - lo:
+                raise ValueError(f'{name}: exported x1 must be exactly {hi - lo:#x} bytes, got {len(area):#x}')
+            # Same offsets as the image: incbin the exported file from 0 by shifting the source window.
+            section_image, chunk_source, lo, hi = area_image, area, 0, hi - lo
         real = max(0, min(hi, len(chunk_source))-lo)
         if real: asm += [f'    .incbin "{section_image.resolve()}", {lo:#x}, {real:#x}']
         if hi-lo > real: asm += [f'    .space {hi-lo-real:#x}']
