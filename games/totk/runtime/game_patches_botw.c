@@ -2,6 +2,7 @@
    TOTK_JQ_CHECK diagnostics. The functions the shared runtime calls for the output size and keys 3 / 4 answer
    "not available" until BotW's own sites are found. */
 #include <TargetConditionals.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -333,6 +334,7 @@ static void patch_realtime(Module *m) {
    - WAKE_SKIP: a worker with an empty ring whose idle event the wake leaves alone while that worker runs a queue. */
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -370,35 +372,127 @@ static unsigned excl_acquire(uint8_t *code, size_t n, int apply) {
     }
     return done;
 }
-/* Docked render size (TOTK_RENDER_RES=900: as shipped). The display-mode routine (main+0x1821644, run when the operation
-   mode is set, before the render targets are made) stores the screen width 1920.0 and the render width 1600.0 as one
-   pair (+0x1290 / +0x1294 of the graphics system); the renderer scales its targets by render / screen width, so docked
-   play draws the scene at 1600x900 and upscales it into the 1920x1080 canvas. 1920.0 makes it native 1080p: every scene
-   target is made at 1920x1080 (and 960x540 for the half-size ones; pass dumps 2026-10-20) at the same frame rate on the
-   Great Plateau. Above the screen size the game fails to make its heaps, and a 2560x1440 screen needs larger heaps than
-   the game asks for (PlacementMgr fails after a 320 MB render budget at main+0x1804c44): not done.
-   main+0x1821674 movk x8, #0x44c8, lsl #48 (1600.0) -> movk x8, #0x44f0, lsl #48 (1920.0). */
-static void patch_render_1080(Module *m) {
-    const char *e = code_switch("TOTK_RENDER_RES");
-    if (e && !strcmp(e, "900")) { fprintf(stderr, "[botw] docked render size 1600x900, as shipped (TOTK_RENDER_RES=900)\n"); return; }
-    static const struct { uint32_t off, original; } check[] = {
-        {0x1821670u, 0xd2a89e08u}, {0x1821674u, 0xf2e89908u}, {0x1821678u, 0xf9094b88u},
-    };
-    for (size_t i = 0; i < sizeof check / sizeof *check; i++) {
-        if (CODE_PATCHED_AT_BUILD && check[i].off == 0x1821674u) continue;   /* iOS: put_word checks the replaced word */
-        uint32_t w; memcpy(&w, m->base + check[i].off, 4);
-        if (w != check[i].original) {
-            fprintf(stderr, "[botw] render size main+%#x: found %08x expected %08x\n", check[i].off, w, check[i].original);
-            runtime_fail("1080p render size requires the 1.6.0 display-mode instructions");
+/* Docked display size (TOTK_BOTW_RES=<w>x<h>: native 1440p, 4K, ...; default 1920x1080) and render size (TOTK_RENDER_RES=900:
+   the shipped 1600x900 at 1080p). The game's sizes are immediates in its code; they now come from the loader's data page
+   after main (the page patch_realtime uses), so the size is chosen at launch on the Mac and on the phone alike (whose code is
+   patched at build time): the host writes the page before the game starts.
+   - The display-mode routine (main+0x1821644, run when the operation mode is set, before the render targets are made)
+     stores the screen and render widths as one float pair (+0x1290 / +0x1294 of the graphics system; the renderer scales
+     its targets by render / screen width: docked as shipped 1920.0 / 1600.0, a 1600x900 scene upscaled into the 1080p
+     canvas) and the size {1920, 1080} into two display globals:
+       main+0x1821670  movz x8, #0x44f0, lsl #16       -> adrp x8, <page>
+       main+0x1821674  movk x8, #0x44c8, lsl #48       -> ldr  x8, [x8, #0x88]    {screen width, render width} (floats)
+       main+0x1821684  mov  x9, #0x780                 -> adrp x9, <page>
+       main+0x1821688  movk x9, #0x438, lsl #32        -> ldr  x9, [x9, #0x80]    {w, h}
+   - A function-local static {1920, 1080} (main+0x2ccdb10: the swapchain and the canvas) is set by six functions inline
+     under a guard (mov x9, #0x780; adrp x8; add x8; movk x9, #0x438, lsl #32; str x9, [x8]): the same two words each.
+   - Memory (the heap traces of 2026-10-20, TOTK_HEAP_LOG): above 1080p the render targets outgrow a fixed 115 MB budget
+     of the graphics system (main+0x1804c44 mov w8, #0x7300000: the render-target report "[%s] (%4dx%4d) size:%d" and a
+     null pointer at main+0x1296d00), and a bigger budget comes out of GameScene: OpenWorldStage takes what is left of it
+     and its PlacementMgr動的 (328 MB, main+0x1c3790c) then fails. GameScene is the rest of uking::frm::System, the rest of
+     the root heap after KingSystem; the root heap is a fixed arena (main+0xe53fa0 mov w21, #0xc1000000) in the nn heap
+     nninitStartup sets (main+0xe536dc mov w0, #0xc3000000, then 32 MB for malloc). All three are one instruction, so each
+     becomes a branch to three words of padding (udf #0 after a branch, before the next function) that load the value:
+       main+0x1804c44 -> main+0x1805124: adrp x8, <page>;  ldr w8,  [x8,  #0x90];  b main+0x1804c48   the budget
+       main+0xe536dc  -> main+0xe53664:  adrp x0, <page>;  ldr w0,  [x0,  #0x94];  b main+0xe536e0    the nn heap
+       main+0xe53fa0  -> main+0xe535f4:  adrp x21, <page>; ldr w21, [x21, #0x98];  b main+0xe53fa4    the root arena
+     Above 1080p the budget grows with the pixels (x 1.125: 230 MB at 2560x1440, 518 MB at 3840x2160) and the heap, the
+     arena and the application pool (runtime_output_res_extra_bytes, services.c) by the budget's growth + 256 MB, at
+     least 512 MB, so every heap the game carves as "the rest" keeps what it had. Checked on an M4 Mac with a Great
+     Plateau save: 2560x1440 and 3840x2160 load into the world at 60 fps (footprint 3.2 / 3.5 GB), the HUD at full size.
+   Handheld mode keeps its own 1280x720 branch of the display routine. */
+enum { DISPLAY_SIZE = 0x80, DISPLAY_WIDTHS = 0x88, DISPLAY_BUDGET = 0x90, DISPLAY_HEAP = 0x94, DISPLAY_ARENA = 0x98 };
+enum { SHIPPED_BUDGET = 0x7300000u, SHIPPED_HEAP = 0xc3000000u, SHIPPED_ARENA = 0xc1000000u };
+static unsigned display_w = 1920, display_h = 1080;
+static uint32_t ldr_x(unsigned rt, unsigned rn, unsigned off) { return 0xf9400000u | (off / 8) << 10 | rn << 5 | rt; }
+static uint32_t ldr_w(unsigned rt, unsigned rn, unsigned off) { return 0xb9400000u | (off / 4) << 10 | rn << 5 | rt; }
+static uint32_t b_to(uint64_t from, uint64_t to) { return 0x14000000u | ((uint32_t)((int64_t)(to - from) / 4) & 0x3ffffffu); }
+/* The display size the player asked for (decided once; also what the application pool is sized for). */
+static int display_size(unsigned *w, unsigned *h) {
+    static int decided; static unsigned dw = 1920, dh = 1080;
+    if (!decided) {
+        decided = 1;
+        const char *e = getenv("TOTK_BOTW_RES");
+        if (e && *e && strcmp(e, "1920x1080")) {
+            if (sscanf(e, "%ux%u", &dw, &dh) != 2 || dw < 1280 || dh < 720 || dw > 7680 || dh > 4320 || (double)dw * dh > 3840.0 * 2160.0 * 1.5)
+                runtime_fail("TOTK_BOTW_RES must be <width>x<height> from 1280x720 up to about 4K (e.g. 2560x1440, 3840x2160)");
         }
     }
-    const uint32_t movk = 0xf2e89e08u;   /* movk x8, #0x44f0, lsl #48 */
-    put_word(m, 0x1821674u, movk, "render size");
-    fprintf(stderr, "[botw] docked render size 1920x1080 (shipped: 1600x900; TOTK_RENDER_RES=900 keeps it)\n");
+    *w = dw; *h = dh;
+    return dw != 1920 || dh != 1080;
 }
+static uint32_t display_budget(void) {
+    unsigned w, h; display_size(&w, &h);
+    double ratio = (double)w * h / (1920.0 * 1080.0);
+    if (ratio <= 1.0) return SHIPPED_BUDGET;
+    return (uint32_t)ceil(SHIPPED_BUDGET * ratio * 1.125 / 1048576.0) << 20;
+}
+uint64_t runtime_output_res_extra_bytes(void) {   /* the nn heap, the root arena and the application pool grow by this */
+    uint32_t budget = display_budget();
+    if (budget <= SHIPPED_BUDGET) return 0;
+    uint64_t extra = (uint64_t)(budget - SHIPPED_BUDGET) + (256u << 20);
+    if (extra < 512u << 20) extra = 512u << 20;
+    return (extra + 0xffffffu) & ~0xffffffull;
+}
+static void patch_display(Module *m) {
+    uint64_t data_off = (m->file_size + 0x3fff) & ~0x3fffULL;
+    if (data_off + 0x4000 != m->size || data_off & 0xfff) runtime_fail("display size page layout");
+    uint8_t *page = m->base + data_off; uint64_t pg = (uintptr_t)page, base = (uintptr_t)m->base;
+    typedef struct { uint32_t off, original, replacement; } site_t;
+    site_t sites[] = {
+        {0x1821670u, 0xd2a89e08u, adrp_reg(8, base + 0x1821670u, pg)}, {0x1821674u, 0xf2e89908u, ldr_x(8, 8, DISPLAY_WIDTHS)},
+        {0x1821684u, 0xd280f009u, adrp_reg(9, base + 0x1821684u, pg)}, {0x1821688u, 0xf2c08709u, ldr_x(9, 9, DISPLAY_SIZE)},
+        {0xe563dcu, 0xd280f009u, 0}, {0xe563e8u, 0xf2c08709u, 0}, {0xe56410u, 0xd280f009u, 0}, {0xe5641cu, 0xf2c08709u, 0},
+        {0x113fb48u, 0xd280f009u, 0}, {0x113fb54u, 0xf2c08709u, 0}, {0x1140208u, 0xd280f009u, 0}, {0x1140214u, 0xf2c08709u, 0},
+        {0x1186ce0u, 0xd280f009u, 0}, {0x1186cecu, 0xf2c08709u, 0}, {0x1805028u, 0xd280f009u, 0}, {0x1805034u, 0xf2c08709u, 0},
+        {0x1804c44u, 0x52a0e608u, b_to(0x1804c44u, 0x1805124u)},   /* mov w8, #0x7300000 (the budget) */
+        {0x1805124u, 0, adrp_reg(8, base + 0x1805124u, pg)}, {0x1805128u, 0, ldr_w(8, 8, DISPLAY_BUDGET)}, {0x180512cu, 0, b_to(0x180512cu, 0x1804c48u)},
+        {0xe536dcu, 0x52b86000u, b_to(0xe536dcu, 0xe53664u)},      /* mov w0, #0xc3000000 (the nn heap) */
+        {0xe53664u, 0, adrp_reg(0, base + 0xe53664u, pg)}, {0xe53668u, 0, ldr_w(0, 0, DISPLAY_HEAP)}, {0xe5366cu, 0, b_to(0xe5366cu, 0xe536e0u)},
+        {0xe53fa0u, 0x52b82015u, b_to(0xe53fa0u, 0xe535f4u)},      /* mov w21, #0xc1000000 (the root arena) */
+        {0xe535f4u, 0, adrp_reg(21, base + 0xe535f4u, pg)}, {0xe535f8u, 0, ldr_w(21, 21, DISPLAY_ARENA)}, {0xe535fcu, 0, b_to(0xe535fcu, 0xe53fa4u)},
+    };
+    const size_t n = sizeof sites / sizeof *sites;
+    for (size_t i = 4; i < 16; i++)   /* the six statics: mov x9 -> adrp x9, <page>; movk x9 -> ldr x9, [x9, #0x80] */
+        sites[i].replacement = i % 2 == 0 ? adrp_reg(9, base + sites[i].off, pg) : ldr_x(9, 9, DISPLAY_SIZE);
+    for (size_t i = 0; !CODE_PATCHED_AT_BUILD && i < n; i++) {   /* iOS: put_word checks the patched words */
+        uint32_t w; memcpy(&w, m->base + sites[i].off, 4);
+        if (w != sites[i].original) {
+            fprintf(stderr, "[botw] display size main+%#x: found %08x expected %08x\n", sites[i].off, w, sites[i].original);
+            runtime_fail("the display size patch requires the 1.6.0 display, memory and padding words");
+        }
+    }
+    for (size_t i = 0; i < n; i++) put_word(m, sites[i].off, sites[i].replacement, "display size");
+    /* the values, written before the game runs (on the phone too: the page is the loader's, not embedded code) */
+    unsigned w, h; int custom = display_size(&w, &h);
+    float widths[2] = {(float)w, (float)w};
+    const char *r = getenv("TOTK_RENDER_RES");
+    if (r && !strcmp(r, "900")) {
+        if (custom) fprintf(stderr, "[botw] TOTK_RENDER_RES=900 ignored: the display is %ux%u (TOTK_BOTW_RES), rendered at that size\n", w, h);
+        else widths[1] = 1600.0f;
+    }
+    uint64_t extra = runtime_output_res_extra_bytes();
+    uint32_t vals[5] = {w, h, display_budget(), SHIPPED_HEAP + (uint32_t)extra, SHIPPED_ARENA + (uint32_t)extra};
+    memcpy(page + DISPLAY_SIZE, vals, 8); memcpy(page + DISPLAY_WIDTHS, widths, 8);
+    memcpy(page + DISPLAY_BUDGET, &vals[2], 4); memcpy(page + DISPLAY_HEAP, &vals[3], 4); memcpy(page + DISPLAY_ARENA, &vals[4], 4);
+    display_w = w; display_h = h;
+    if (widths[1] != widths[0]) fprintf(stderr, "[botw] docked render size 1600x900 in the 1920x1080 display, as shipped (TOTK_RENDER_RES=900)\n");
+    else if (!custom) fprintf(stderr, "[botw] docked render size 1920x1080 (shipped: 1600x900; TOTK_RENDER_RES=900 keeps it)\n");
+    else fprintf(stderr, "[botw] docked display and render size %ux%u (TOTK_BOTW_RES): render-target budget %u MB (shipped 115), heaps and pool +%llu MB\n",
+                 w, h, vals[2] >> 20, (unsigned long long)(extra >> 20));
+}
+/* Diagnostic (Mac): TOTK_HEAP_LOG=1 logs every heap the game creates through its two create functions (ksys main+0x1a52160,
+   sead main+0x125cd50): name, requested size (0: the rest of the parent), parent, and the heap made with its size (field 8). */
+static uint8_t *g_heaplog_main;   /* TOTK_HEAP_LOG (botw_heaplog_hook) */
+static const struct { uint32_t entry, ret, word; } g_heaplog_fn[2] = {{0x1a52160, 0x1a5215c, 0xd10183ffu}, {0x125cd50, 0x125cd4c, 0xf81b0ff9u}};
 void runtime_game_patches(Module *m) {
     fprintf(stderr, "[botw] %s game-code patches\n", TOTK_GAME_VERSION);
-    patch_render_1080(m);
+    patch_display(m);
+    if (code_switch("TOTK_HEAP_LOG")) { uint32_t b = 0xd4200000u | (0x7c1u << 5), was;
+      for (int f = 0; f < 2; f++) { memcpy(&was, m->base + g_heaplog_fn[f].entry, 4);
+        if (was != g_heaplog_fn[f].word) runtime_fail("heaplog: unexpected create function entry");
+        memcpy(m->base + g_heaplog_fn[f].entry, &b, 4); memcpy(m->base + g_heaplog_fn[f].ret, &b, 4); }
+      g_heaplog_main = m->base; }
     if (realtime_enabled()) patch_realtime(m);
     else fprintf(stderr, "[botw] real-time frame step off (TOTK_REALTIME=0): the game advances by its present interval\n");
     { const char *a = code_switch("TOTK_EXCL_ACQUIRE");
@@ -449,7 +543,47 @@ static int botw_pad_hook(ucontext_t *u) {
     }
     u->uc_mcontext->__ss.__pc += 4; return 1;
 }
+static uint8_t *g_heaplog_main;
+static const char *heap_name_guess(uint64_t heap) {   /* a pointer among the heap object's first fields to a printable name */
+    if (!heap) return "-";
+    for (int i = 0; i < 32; i++) {
+        uint64_t p = ((const uint64_t *)(uintptr_t)heap)[i];
+        if (p < 0x100000000ull || p > 0x7fffffffffffull) continue;
+        const unsigned char *c = (const unsigned char *)(uintptr_t)p; int n = 0;
+        if (!((c[0] >= 'A' && c[0] <= 'Z') || (c[0] >= 'a' && c[0] <= 'z') || c[0] == '/')) continue;
+        while (n < 60 && c[n] >= 0x20) n++;
+        if (n >= 3 && c[n] == 0) return (const char *)c;
+    }
+    return "?";
+}
+/* two create functions: ksys's (main+0x1a52160, sub sp, sp, #0x60) and sead's ExpHeap create (main+0x125cd50, str x25,
+   [sp, #-0x50]!); each has a padding word (udf #0) before it, where its return traps */
+static __thread uint64_t g_heaplog_lr[16], g_heaplog_req[16]; static __thread int g_heaplog_depth;
+static int botw_heaplog_hook(ucontext_t *u) {
+    uint64_t *x = u->uc_mcontext->__ss.__x, pc = u->uc_mcontext->__ss.__pc - (uintptr_t)g_heaplog_main;
+    for (int f = 0; f < 2; f++) {
+        if (pc == g_heaplog_fn[f].ret) {   /* the create returned: its heap, then back to the caller */
+            uint64_t heap = x[0], lr = g_heaplog_depth > 0 ? g_heaplog_lr[--g_heaplog_depth] : 0;
+            uint64_t req = g_heaplog_req[g_heaplog_depth]; int at = -1;
+            if (heap && req >= (1u << 20)) for (int i = 0; i < 48; i++) if (((const uint64_t *)(uintptr_t)heap)[i] == req) { at = i; break; }
+            fprintf(stderr, "[heaplog] made %#llx%s size field %d; fields 4..12:", (unsigned long long)heap, heap ? "" : "  (FAILED)", at);
+            if (heap) for (int i = 4; i < 13; i++) fprintf(stderr, " %#llx", (unsigned long long)((const uint64_t *)(uintptr_t)heap)[i]);
+            fputc('\n', stderr);
+            u->uc_mcontext->__ss.__pc = lr; return 1;
+        }
+        if (pc != g_heaplog_fn[f].entry) continue;
+        const char *name = x[1] ? *(const char *const *)(uintptr_t)(x[1] + 8) : "-";
+        fprintf(stderr, "[heaplog] create %-28s size %#10llx (%6.1f MB) parent %#llx (%s) lr main+%#llx fn%d\n", name ? name : "-", (unsigned long long)x[0],
+                x[0] / 1048576.0, (unsigned long long)x[2], heap_name_guess(x[2]), (unsigned long long)(u->uc_mcontext->__ss.__lr - (uintptr_t)g_heaplog_main), f);
+        if (g_heaplog_depth < 16) { g_heaplog_req[g_heaplog_depth] = x[0]; g_heaplog_lr[g_heaplog_depth++] = u->uc_mcontext->__ss.__lr; u->uc_mcontext->__ss.__lr = (uintptr_t)g_heaplog_main + g_heaplog_fn[f].ret; }
+        if (f == 0) u->uc_mcontext->__ss.__sp -= 0x60;   /* the replaced sub sp, sp, #0x60 */
+        else { u->uc_mcontext->__ss.__sp -= 0x50; *(uint64_t *)(uintptr_t)u->uc_mcontext->__ss.__sp = x[25]; }   /* str x25, [sp, #-0x50]! */
+        u->uc_mcontext->__ss.__pc += 4; return 1;
+    }
+    return 0;
+}
 int botw_jq_hook(void *context) {   /* SIGTRAP from loader.c crash(): 1 = it was one of ours, handled */
+    if (g_heaplog_main && botw_heaplog_hook(context)) return 1;
     if (g_pad_log_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_pad_main + PAD_LOOP) return botw_pad_hook(context);
     if (!g_jq_on) return 0;
     ucontext_t *u = context; uint64_t pc = u->uc_mcontext->__ss.__pc, *x = u->uc_mcontext->__ss.__x;
@@ -522,8 +656,7 @@ int botw_jq_hook(void *context) {   /* SIGTRAP from loader.c crash(): 1 = it was
 #undef U64
 int runtime_output_res(unsigned *w, unsigned *h) { (void)w; (void)h; return 0; }
 int runtime_render_res(unsigned *w, unsigned *h) { (void)w; (void)h; return 0; }   /* no scene size above 1600x900 for the heaps (romfs.c) */
-uint64_t runtime_output_size_current(void) { return 1920ull | (1080ull << 32); }   /* the canvas this game draws (frontend.m's shortcut text); no output-size patch yet */
-uint64_t runtime_output_res_extra_bytes(void) { return 0; }
+uint64_t runtime_output_size_current(void) { return display_w | (uint64_t)display_h << 32; }   /* the docked canvas (patch_display; frontend.m's shortcut text) */
 /* Pre-rendered movies (the memories, the intro): the movie player advances one movie frame per game frame, so above
    30 fps they ran fast, out of step with their sound, and a cutscene could wait for ever (2026-10-20). main+0x2cbef40
    holds the movie object while one plays (stored at main+0x1600e74 when it is made, cleared at main+0x1a4d6f0 after it

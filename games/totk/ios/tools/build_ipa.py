@@ -118,6 +118,14 @@ def main():
         ios,logs/'xcodebuild-ios.log',env)
     app=derived/'Build/Products/Release-iphoneos/TOTK.app'
     if not app.is_dir(): raise RuntimeError(f'Xcode did not produce {app}')
+    if not botw:   # the native 1440p / 4K choices patch Breath of the Wild only (game_patches_botw.c patch_display)
+        import plistlib
+        root=app/'Settings.bundle/Root.plist'; spec=plistlib.loads(root.read_bytes())
+        for item in spec['PreferenceSpecifiers']:
+            if item.get('Key')=='graphics':
+                keep=[i for i,v in enumerate(item['Values']) if not v.startswith('native-')]
+                item['Values']=[item['Values'][i] for i in keep]; item['Titles']=[item['Titles'][i] for i in keep]
+        root.write_bytes(plistlib.dumps(spec))
     # Carry the increased-memory-limit entitlement in the executable's ad-hoc signature so re-signing tools keep it;
     # the game's 3.2 GiB pool exceeds the default iOS footprint limit.
     run(['codesign','--force','--sign','-','--entitlements',ios/'Sources/TOTK.entitlements',app/'TOTK'],ios,logs/'ios-entitlements.log',env)

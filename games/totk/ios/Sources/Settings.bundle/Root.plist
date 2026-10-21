@@ -8,7 +8,7 @@
 		<dict>
 			<key>Type</key><string>PSGroupSpecifier</string>
 			<key>Title</key><string>Graphics</string>
-			<key>FooterText</key><string>Takes effect the next time the game starts. Docked renders at 1920x1080 (Breath of the Wild) and uses more battery and heat; MetalFX then upscales the picture to this screen's full resolution.</string>
+			<key>FooterText</key><string>Takes effect the next time the game starts. Docked renders at 1920x1080 (Breath of the Wild) and uses more battery and heat; MetalFX then upscales the picture to this screen's full resolution. Native renders the game itself at 1440p or 4K (Breath of the Wild only): sharper, with more memory, battery and heat.</string>
 		</dict>
 		<dict>
 			<key>Type</key><string>PSMultiValueSpecifier</string>
@@ -20,12 +20,16 @@
 				<string>Handheld, 1280x720</string>
 				<string>Docked, 1920x1080</string>
 				<string>Docked + MetalFX to screen</string>
+				<string>Native 2560x1440</string>
+				<string>Native 3840x2160 (4K)</string>
 			</array>
 			<key>Values</key>
 			<array>
 				<string>handheld</string>
 				<string>docked</string>
 				<string>docked-mfx</string>
+				<string>native-1440</string>
+				<string>native-2160</string>
 			</array>
 		</dict>
 	</array>

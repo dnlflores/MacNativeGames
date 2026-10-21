@@ -123,11 +123,16 @@ static void audio_observe(void) {
                     1600x900 into a 1080p picture; the drawable is 1080 rows, so the system scales it to the screen
        docked-mfx - docked, and MetalFX upscales the 1080p picture to the screen's own pixels (the Mac's 2K output stage,
                     totk_mfx_up.m MFXUP_OUTPUT) instead of the system's bilinear stretch
+       native-1440, native-2160 (Breath of the Wild) - docked, the game itself renders and lays out 2560x1440 / 3840x2160
+                    (TOTK_BOTW_RES, game_patches_botw.c patch_display); the drawable has the screen's own pixels, so a
+                    picture bigger than the screen is scaled down (4K: supersampled)
        A test launch's environment (devicectl --environment-variables) still wins over the setting. */
     NSString *graphics = [NSUserDefaults.standardUserDefaults stringForKey:@"graphics"] ?: @"handheld";
-    BOOL docked = [graphics isEqualToString:@"docked"] || [graphics isEqualToString:@"docked-mfx"];
+    NSString *native = [graphics isEqualToString:@"native-1440"] ? @"2560x1440" : [graphics isEqualToString:@"native-2160"] ? @"3840x2160" : nil;
+    BOOL docked = native || [graphics isEqualToString:@"docked"] || [graphics isEqualToString:@"docked-mfx"];
     setenv("TOTK_OPERATION_MODE", docked ? "docked" : "handheld", 0);
     if ([graphics isEqualToString:@"docked-mfx"]) { setenv("TOTK_IOS_DRAWABLE_H","0",0); setenv("TOTK_MFX_UPSCALE","1",0); setenv("TOTK_MFX_OUTPUT","1",0); }
+    else if (native) { setenv("TOTK_BOTW_RES",native.UTF8String,0); setenv("TOTK_IOS_DRAWABLE_H","0",0); }
     else if (docked) setenv("TOTK_IOS_DRAWABLE_H","1080",0);
     setenv("TOTK_ROMFS_PATCHES",[res stringByAppendingPathComponent:@"romfs-patches"].fileSystemRepresentation,1);
     setenv("TOTK_ROMFS_PATCHES_OUT",[res stringByAppendingPathComponent:@"romfs-patches-out"].fileSystemRepresentation,1);
