@@ -214,6 +214,15 @@ static unsigned open_file(uint64_t *out, const char *path, int mode) {
     pthread_mutex_unlock(&lock); runtime_fail("host file handle table full");
 }
 static unsigned read_file(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size) {
+#ifdef GAME_BOTW
+    /* Breath of the Wild pins its threads to virtual cores (threads.c): a game-data read blocks like Horizon's fsp-srv
+       request and gives the core up meanwhile, so the sound and job threads queued on that core are not held for a
+       whole pread (seen in the iPad log: core 2 held through runtime_romfs_read). */
+    if (runtime_romfs_handle(h) || runtime_aoc_handle(h)) {
+        __attribute__((cleanup(runtime_core_back))) int away = runtime_core_away();
+        if (runtime_romfs_handle(h)) return runtime_romfs_read(out, h, offset, buffer, size); BOTW_AOC_READ(out, h, offset, buffer, size)
+    }
+#endif
     if (runtime_romfs_handle(h)) return runtime_romfs_read(out, h, offset, buffer, size); BOTW_AOC_READ(out, h, offset, buffer, size)
     int fd, mode; if (!out || offset < 0 || (!buffer && size) || !file_of(h, &fd, &mode)) return R_INVALID_ARGUMENT;
     if (!(mode & OPEN_READ)) return R_OPEN_MODE;

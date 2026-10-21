@@ -116,7 +116,15 @@ static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTi
     if(!atomic_load_explicit(&m->playing,memory_order_acquire)){
         memset(out,0,(size_t)frames*2*sizeof(float));m->ready=0;atomic_store_explicit(&m->rd,wr,memory_order_release);return noErr;
     }
-    uint64_t prefill=(uint64_t)m->frame*(uint64_t)prefill_blocks();if(prefill<frames)prefill=frames;if(prefill>RING_FRAMES)prefill=RING_FRAMES;
+    uint64_t prefill=(uint64_t)m->frame*(uint64_t)prefill_blocks();
+#if TARGET_OS_IPHONE
+    /* iOS pulls 1024 frames per callback (more than the default 20 ms): the headroom comes on top of one callback, or
+       playback starts with 0-5 ms in hand and one late 5-ms block runs the device dry. */
+    prefill+=frames;
+#else
+    if(prefill<frames)prefill=frames;
+#endif
+    if(prefill>RING_FRAMES)prefill=RING_FRAMES;
     if(!m->ready){
         /* prefill_blocks() 5-ms blocks (default four, 20 ms) of scheduling headroom for the producer.
            A real underrun still counts and requires a fresh prefill. */

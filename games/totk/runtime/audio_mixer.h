@@ -24,6 +24,9 @@ typedef struct AudioRenderer {
     uint32_t state, revision, time_limit, event; int logged;
     uint64_t behavior_flags, elapsed_frames;
     uint64_t stop_released, empty_played, flushed, logged_released;   /* wave buffers given back by Stop / without samples / by FlushWaveBuffers */
+    /* game supply per 5-s window (render_thread): blocks rendered since the game's last RequestUpdate, blocks rendered with
+       no update since the one before (late), the longest run, started voices that had no wave buffer queued (dry) */
+    uint32_t since_update, late_blocks, max_gap, dry_voice_blocks;
     ServerVoice *voices; AudrenPoolIn *pools; AudrenMixIn *mixes; AudrenSinkIn *sinks; AudrenEffectIn *effects; AudrenChannelIn *channels;
     void *mixer;
 } AudioRenderer;

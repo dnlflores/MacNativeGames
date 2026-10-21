@@ -9,6 +9,12 @@
 #include "audio_reverb.h"
 #include <math.h>
 #include <pthread.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -142,6 +148,7 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
     need(h.total <= in_size, "update total size");
     Reader in = {input + sizeof h, input + h.total};
     pthread_mutex_lock(&r->lock);
+    r->since_update = 0;
     r->revision = h.revision;
     const int vc = r->param.voice_count, ec = r->param.effect_count, sc = r->param.sink_count, mc = r->param.submix_count + 1;
     const uint32_t npools = (uint32_t)ec + 4u * (uint32_t)vc;
@@ -252,14 +259,35 @@ static void *render_thread(void *p) {
     AudioRenderer *r = p;
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
     const double frame = (double)r->param.sample_count / r->param.sample_rate;
+#if TARGET_OS_IPHONE
+    /* iOS: a real-time period like CoreAudio's own I/O thread (one 5-ms block, about a fifth of it to render), so the
+       game's busy job threads cannot delay the block cadence the mixer ring is fed at. Best effort: QoS stays if refused. */
+    {
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        uint32_t period = (uint32_t)(frame * 1e9 * tb.denom / tb.numer);
+        thread_time_constraint_policy_data_t pol = {period, period / 5, period, 1};
+        kern_return_t kr = thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
+                                             (thread_policy_t)&pol, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+        fprintf(stderr, "[totk-audio] render thread real-time period %.1f ms: %s\n", frame * 1e3, kr == KERN_SUCCESS ? "on" : "refused, QoS only");
+    }
+#endif
     struct timespec next; clock_gettime(CLOCK_MONOTONIC, &next);
     while (__atomic_load_n(&r->running, __ATOMIC_ACQUIRE)) {
         pthread_mutex_lock(&r->lock);
         if (r->state == 0) {
             audio_voices_prepare(r);
+            if (++r->since_update >= 2) r->late_blocks++;
+            if (r->since_update > r->max_gap) r->max_gap = r->since_update;
+            for (int i = 0; i < r->param.voice_count; i++) { ServerVoice *v = &r->voices[i]; if (v->in.in_use && v->state == SV_STARTED && !v->valid[v->index]) r->dry_voice_blocks++; }
             audio_mixer_render(r, frame);
             for (int i = 0; i < r->param.voice_count; i++) advance_voice(r, &r->voices[i], frame);
             r->elapsed_frames++;
+            if (r->elapsed_frames % 1000 == 0) {
+                if (r->late_blocks || r->dry_voice_blocks)
+                    fprintf(stderr, "[totk-audio] game supply over 5 s: %u of 1000 blocks without a new update (longest %u blocks), %u dry voice blocks\n",
+                            r->late_blocks, r->max_gap, r->dry_voice_blocks);
+                r->late_blocks = r->max_gap = r->dry_voice_blocks = 0;
+            }
             if (r->stop_released + r->empty_played + r->flushed != r->logged_released && r->elapsed_frames % 1000 == 0) {
                 r->logged_released = r->stop_released + r->empty_played + r->flushed;
                 fprintf(stderr, "[totk-audio] wave buffers given back: %llu by stopped voices, %llu without samples, %llu flushed (since start)\n",
