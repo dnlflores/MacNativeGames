@@ -463,6 +463,12 @@ static _Atomic uint64_t g_ka_n, g_ka_us, g_ka_max_us;   // spin kernels complete
 void mtl_keepalive_stats(uint64_t v[3]) { v[0] = atomic_load(&g_ka_n); v[1] = atomic_load(&g_ka_us); v[2] = atomic_exchange(&g_ka_max_us, 0); }
 static void keepalive_start(void) {
     static int started; const char *e = getenv("TOTK_GPU_KEEPALIVE");
+#if defined(GAME_BOTW) && TARGET_OS_IPHONE
+    /* Breath of the Wild on iPhone / iPad: off unless TOTK_GPU_KEEPALIVE=1. Its frames leave the GPU mostly idle (p50
+       3.7-7 ms at 60 fps on an M4 iPad), so the spinner ran ~10 kernels a frame (up to 4.35 ms each, delaying the game's
+       own command buffers) for heat the frame rate does not need. */
+    if (!e || !atoi(e)) return;
+#endif
     if (started || (e && !atoi(e)) || nogpu() || getenv("TOTK_HEADLESS")) return; started = 1;   // not in standalone probes
     NSError *err = nil;
     id<MTLLibrary> lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nkernel void keep(device float *a [[buffer(0)]], constant uint &n [[buffer(1)]], uint i [[thread_position_in_grid]]) { float x = a[i]; for (uint j = 0; j < n; j++) x = fma(x, 1.0000001f, 0.5f); a[i] = x; }\n" options:nil error:&err];
@@ -5107,12 +5113,14 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
         char key[65];for(unsigned j=0;j<32;j++)snprintf(key+2*j,3,"%02x",md[j]);
         // TOTK: stage from control+0x714 (0 vertex, 1 fragment, 5 compute); translation answered from the bound state.
         int st=(int)nvn_stage;if(st!=0&&st!=1&&st!=5)MDIE("TOTK shader %s: unsupported NVN stage %u",key,nvn_stage);
-        if (getenv("TOTK_CTL_DUMP")) {   // diagnostic: the control section the game hands NVN, per shader (offline shader discovery is checked against it)
-            static FILE *df; if (!df) df = fopen(getenv("TOTK_CTL_DUMP"), "a");
+        static const char *ctl_dump = (const char *)1; if (ctl_dump == (const char *)1) ctl_dump = getenv("TOTK_CTL_DUMP");   // read once (every stage of every new program)
+        if (ctl_dump) {   // diagnostic: the control section the game hands NVN, per shader (offline shader discovery is checked against it)
+            static FILE *df; if (!df) df = fopen(ctl_dump, "a");
             if (df) { uint8_t cm[32]; char ch[65]; const uint8_t *cd = (const uint8_t *)(uintptr_t)p->sd[i].data; size_t skip = st == 5 ? 0 : 0x30;
                 CC_SHA256(cd + skip, (CC_LONG)(length > skip ? length - skip : 0), cm); for (unsigned j = 0; j < 32; j++) snprintf(ch + 2*j, 3, "%02x", cm[j]);
                 fprintf(df, "%s\t%d\t%s\t", key, st, ch); for (int k = 0; k < 0x880; k++) fprintf(df, "%02x", control[k]); fputc('\n', df); fflush(df); } }
-        if (getenv("TOTK_CS_PROBE")) { static int nd; if (nd++ < 6) { char b[4096]; size_t o = 0; const uint8_t *cd = (const uint8_t *)(uintptr_t)p->sd[i].data;
+        static int cs_probe = -1; if (cs_probe < 0) cs_probe = getenv("TOTK_CS_PROBE") != NULL;
+        if (cs_probe) { static int nd; if (nd++ < 6) { char b[4096]; size_t o = 0; const uint8_t *cd = (const uint8_t *)(uintptr_t)p->sd[i].data;
             for (int k = 0x6c0; k < 0x880; k += 4) { uint32_t w; memcpy(&w, control + k, 4); if (w) o += snprintf(b + o, sizeof b - o, " %03x:%x", k, w); }
             o += snprintf(b + o, sizeof b - o, " | code:"); for (int k = 0; k < 0x30; k += 4) { uint32_t w; memcpy(&w, cd + k, 4); o += snprintf(b + o, sizeof b - o, " %x", w); }
             MLOG("[ctl st%d]%s", st, b); } }
@@ -5300,6 +5308,10 @@ static void pkg_orphan_report(void) {
     MLOG("素材贴图副本 至提交 %llu：在册 %zu 个 / %llu MB，其中所在内存池已删 %llu 个 / %llu MB", (unsigned long long)g_sub_serial, n, (unsigned long long)(total >> 20),
          (unsigned long long)orphan_n, (unsigned long long)(orphan_b >> 20));
 }
+/* iOS memory warning (frontend_ios.m): the next submission sweeps at once, as if memory were critical, before the system
+   ends the app instead. */
+static _Atomic int g_mem_warning;
+void mtl_memory_warning(void) { atomic_store(&g_mem_warning, 1); }
 static void pkg_evict_sweep(void) {
     static int mode = -1; static uint64_t budget, low, high, crit;
     if (mode < 0) {
@@ -5309,9 +5321,12 @@ static void pkg_evict_sweep(void) {
         if (mode == 1) MLOG("贴图副本淘汰：开（可用内存低于 %llu MB 时淘汰久未使用的副本，直到 %llu MB；TOTK_TEX_EVICT=0 关）", (unsigned long long)(low >> 20), (unsigned long long)(high >> 20));
         if (mode == 2) MLOG("贴图副本淘汰：开（副本总量上限 %llu MB）", (unsigned long long)(budget >> 20));
     }
-    if (!mode || (g_sub_serial & 3)) return;
+    if (!mode) return;
+    int warned = mode == 1 && atomic_exchange(&g_mem_warning, 0);
+    if (!warned && (g_sub_serial & 3)) return;
     uint64_t avail = 0, want = 0;
-    if (mode == 1) { avail = evict_available(); if (!avail || avail >= low) return; want = high - avail; }
+    if (mode == 1) { avail = evict_available(); if (!warned && (!avail || avail >= low)) return; want = warned ? high : high - avail; }
+    if (warned) MLOG("系统内存警告：立即淘汰闲置贴图副本（可用 %llu MB）", (unsigned long long)(avail >> 20));
     pthread_mutex_lock(&g_rmu);
     pthread_mutex_lock(&g_smu);
     /* texture-pool ids resolved on the fast path count as uses of their serial's copy */
@@ -5322,7 +5337,7 @@ static void pkg_evict_sweep(void) {
     }
     size_t n = 0, cap = 0; evict_cand *c = NULL; uint64_t total = 0, total_n = 0;
     NSUInteger fmt_pf[16]; uint64_t fmt_b[16], fmt_n[16]; int nfmt = 0;   // copies by Metal pixel format (log)
-    uint64_t idle = mode == 1 && avail < crit ? EVICT_IDLE_CRIT : EVICT_IDLE;
+    uint64_t idle = mode == 1 && (warned || avail < crit) ? EVICT_IDLE_CRIT : EVICT_IDLE;
     for (uint32_t i = 0; i < g_by_serial.cap; i++) {
         __unsafe_unretained id o = (__bridge id)g_by_serial.vals[i];
         if (!o || ![o isKindOfClass:[NvPkg class]]) continue;
@@ -6381,7 +6396,7 @@ static NvShader *warm_shader(NSMutableDictionary<NSString *, NvShader *> *dict, 
    one quits. build_app.py compiles the seed once at packaging time from the game binary's folder, with no other program
    using the store: tools/warm_metal_cache.m.) Once the player is in the world (mtl_warm_wait returned) at most 2 threads go on, so the
    rest of the warm-up does not take the game's cores. TOTK_WARM_THREADS=<n> (1 = one thread as before); default 8 on the
-   Mac (at most the core count minus 2), 1 on iOS (prebuilt libraries, nothing to compile). */
+   Mac (at most the core count minus 2), on iOS 2 with 8 cores or more, else 1. */
 enum { WARM_BLOCK = 512 };   // rows per block: the shaders of a block load in parallel, then its rows run in order
 static _Atomic int g_warm_in_play;
 static int warm_threads(void) {
@@ -6389,7 +6404,9 @@ static int warm_threads(void) {
     dispatch_once(&once, ^{
         const char *e = getenv("TOTK_WARM_THREADS");
 #if TARGET_OS_IPHONE
-        int d = 1;
+        /* 2 where the device has 8 cores or more (M-series iPads, recent iPhones): the warm-up halves (11,148 prebuilt
+           libraries took 8.3 s on one thread on an M4 iPad), and variants translated on the device compile from source */
+        int d = NSProcessInfo.processInfo.activeProcessorCount >= 8 ? 2 : 1;
 #else
         int d = (int)NSProcessInfo.processInfo.activeProcessorCount - 2; if (d > 8) d = 8; if (d < 1) d = 1;
 #endif
@@ -14148,10 +14165,11 @@ int botw_dead_keep(uint64_t serial) {
     extern int dm_nvn_pin_has_serial(uint64_t serial);
     if (!dm_nvn_pin_has_serial(serial)) return 0;
     pthread_mutex_lock(&g_smu);
-    if (!nvn_hm_get(&g_bdead_kept, &serial)) { nvn_hm_put(&g_bdead_kept, &serial, (void *)1); g_bdead_kept_n++; }
+    int added = !nvn_hm_get(&g_bdead_kept, &serial);
+    if (added) { nvn_hm_put(&g_bdead_kept, &serial, (void *)1); g_bdead_kept_n++; }
     uint64_t k = g_bdead_kept_n, live = g_bdead_kept.n;
     pthread_mutex_unlock(&g_smu);
-    if (k <= 4 || k % 1000 == 0) MLOG("[dead-keep] finalised serial %llu stays while a recording copy names it (%llu kept so far, %llu now)", (unsigned long long)serial, (unsigned long long)k, (unsigned long long)live);
+    if (added && (k <= 4 || k % 1000 == 0)) MLOG("[dead-keep] finalised serial %llu stays while a recording copy names it (%llu kept so far, %llu now)", (unsigned long long)serial, (unsigned long long)k, (unsigned long long)live);
     return 1;
 }
 void botw_dead_forget(const uint64_t *serials, size_t n) {

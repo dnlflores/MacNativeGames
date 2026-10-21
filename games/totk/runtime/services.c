@@ -247,7 +247,8 @@ static int operation_mode(void) {return handheld_mode()?0:1;}
 static int performance_mode(void) {return handheld_mode()?0:1;}
 static int focus_policy;
 static void focus_mode(int mode) {if(mode<0||mode>3)runtime_fail("unknown focus handling mode");focus_policy=mode;runtime_startup_checkpoint((uintptr_t)__builtin_return_address(0));fprintf(stderr,"[totk] focus policy stored: %d (window lifecycle pending)\n",focus_policy);}
-static int focus_state(void) {return runtime_front_focus();}
+/* Horizon AppletFocusState: 1 InFocus, 2 OutOfFocus (3 Background is not used); 0 is not a state the game knows. */
+static int focus_state(void) {return runtime_front_focus()?1:2;}
 static unsigned resume_notification,operation_notification,performance_notification;
 static void resume_enabled(unsigned value) {resume_notification=value&255;}
 static void operation_enabled(unsigned value) {operation_notification=value&255;}
@@ -344,7 +345,7 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
   case 2:value=ALIAS_START;break;case 3:value=ALIAS_SIZE;break;
   case 4:value=(uintptr_t)heap;break;case 5:value=HEAP_CAP;break;
   case 6:case 21:value=APP_POOL;break;case 7:case 22:value=runtime_image_bytes()+heap_size+alias_bytes;
-   { static unsigned polls; if(getenv("TOTK_MEM_LOG")&&(polls++%600)==0) fprintf(stderr,"[totk-mem] GetInfo(%u) total=%#llx used=%#llx image=%#llx heap=%#llx alias=%#llx\n",id,(unsigned long long)APP_POOL,(unsigned long long)value,(unsigned long long)runtime_image_bytes(),(unsigned long long)heap_size,(unsigned long long)alias_bytes); }
+   { static unsigned polls; static int mem_log=-1; if(mem_log<0)mem_log=getenv("TOTK_MEM_LOG")!=NULL; if(mem_log&&(polls++%600)==0) fprintf(stderr,"[totk-mem] GetInfo(%u) total=%#llx used=%#llx image=%#llx heap=%#llx alias=%#llx\n",id,(unsigned long long)APP_POOL,(unsigned long long)value,(unsigned long long)runtime_image_bytes(),(unsigned long long)heap_size,(unsigned long long)alias_bytes); }
    break;
   case 8:value=0;break;case 10:value=0;break;
   case 11:arc4random_buf(&value,8);break;
