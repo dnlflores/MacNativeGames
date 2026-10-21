@@ -6,7 +6,7 @@ iOS has no shader translator. On a miss the game skips the draws that need the v
 pulls those requests, translates them with the Mac's runtime service (build/shader-service/totk_xlate) into the Mac
 cache, compiles device metallibs, and pushes one pack in the startup-seed format to Documents/shader-fill/. The game
 checks and merges the pack on its next start (totk_fill_import) and warms the new variants in the background.
-usage: fill_shaders.py --tree <work tree> --device <id> [--bundle-id <id>] [--requests <dir>] [--with-done] [--no-push]"""
+usage: fill_shaders.py --tree <work tree> --device <id> [--game totk|botw] [--bundle-id <id>] [--requests <dir>] [--with-done] [--no-push]"""
 import argparse, concurrent.futures, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 from xcode_dir import developer_dir
@@ -15,7 +15,7 @@ from compile_seed import METAL_FLAGS
 TOTK = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(TOTK/'scripts'))
 from shader_list import ShaderList   # noqa: E402
-SHADER_LIST = TOTK/'assets/shader_list.tsv'
+SHADER_LISTS = {'totk': TOTK/'assets/shader_list.tsv', 'botw': TOTK.parent/'botw/assets/shader_list.tsv'}   # the lists never mix
 VARIANT = re.compile(r'^([0-9a-f]{64})-[0-9a-f]{12}$')
 HEX = re.compile(r'^(?:[0-9a-f]{2})+$')
 MAX_CODE = 16 << 20   # the runtime's own limit on a shader's code area
@@ -57,8 +57,9 @@ def translate(rqs, tree, out, ch):
     todo = [rq for rq in rqs if not (out/f"{rq['variant']}_b.metal").is_file()]
     print(f'{len(rqs)} requests, {len(todo)} not yet translated on this Mac')
     if not todo: return set()
-    service = tree/'build/shader-service/totk_xlate'
-    if not os.access(service, os.X_OK): raise RuntimeError(f'missing {service} (make shader-service)')
+    # a build_app.py work tree carries the pinned prebuilt service; a development tree may have built its own
+    service = next((p for p in (tree/'build/shader-service/totk_xlate', tree/'prebuilt/macos-arm64/totk_xlate') if os.access(p, os.X_OK)), None)
+    if not service: raise RuntimeError(f'no shader service in {tree} (build/shader-service or prebuilt/macos-arm64: make shader-service)')
     svc = subprocess.Popen([str(service), '--service', '--spirv-cross', str(tree/'build/spirv-cross/spirv-cross'), '--out', str(out),
                             '--chain', ch], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     failed = set()
@@ -118,12 +119,14 @@ def main():
     ap = argparse.ArgumentParser(description='Translate the shaders an iOS device missed and push them back to it.')
     ap.add_argument('--tree', type=Path, required=True, help='prepared work tree (build/shader-service, build/spirv-cross)')
     ap.add_argument('--device', default=os.environ.get('TOTK_IOS_DEVICE'), help='devicectl device id (or TOTK_IOS_DEVICE)')
-    ap.add_argument('--bundle-id', default=os.environ.get('TOTK_BUNDLE_ID', 'org.macnativegames.totk'))
+    ap.add_argument('--game', choices=sorted(SHADER_LISTS), default='totk', help='which shared shader list the variants join')
+    ap.add_argument('--bundle-id', default=os.environ.get('TOTK_BUNDLE_ID'), help='default: org.macnativegames.<game>')
     ap.add_argument('--requests', type=Path, help='use requests already copied from the device instead of pulling them')
     ap.add_argument('--no-push', action='store_true', help='translate and build the pack, but do not send it')
     ap.add_argument('--with-done', action='store_true', help='also rebuild the variants filled before (shader-requests/done),'
                     ' e.g. after a change of the compile options; the game replaces their libraries')
     args = ap.parse_args()
+    args.bundle_id = args.bundle_id or f'org.macnativegames.{args.game}'
     if not args.requests and not args.device: raise RuntimeError('give --device (or TOTK_IOS_DEVICE), or --requests')
     if not args.no_push and not args.device: raise RuntimeError('pushing needs --device (or TOTK_IOS_DEVICE); use --no-push')
     tree = args.tree.resolve(); ch = chain(); env = xcode_env()
@@ -151,8 +154,9 @@ def main():
         count = build_pack(pack, out, variants, ch, env)
         # What this device needed goes into the one shared list, so every later build carries it (docs/shader-list.md).
         # The pack's index rows are written by build_pack, so the list is merged from the pack after it is built.
-        shared = ShaderList.load(SHADER_LIST); before = len(shared.variants); shared.add_cache(pack); shared.save(SHADER_LIST)
-        print(f'shared shader list: {len(shared.variants) - before} new variants ({SHADER_LIST}; send them in a pull request)')
+        shader_list = SHADER_LISTS[args.game]
+        shared = ShaderList.load(shader_list); before = len(shared.variants); shared.add_cache(pack); shared.save(shader_list)
+        print(f'shared shader list: {len(shared.variants) - before} new variants ({shader_list}; send them in a pull request)')
         print(f'pack {name}: {len(variants)} variants, {count} files' + (f', {len(failed)} failed' if failed else ''))
         if args.no_push:
             keep = tree/'build/shader-fill'/name; keep.parent.mkdir(parents=True, exist_ok=True); shutil.move(str(pack), keep)
