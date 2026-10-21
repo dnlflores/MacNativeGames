@@ -170,11 +170,13 @@ static void overlay_load(const char *dir,int required) {
  char line[8192];size_t first=noverlay;uint64_t hashed=0,t0=runtime_now_ns();
  while(fgets(line,sizeof(line),m)){
   if(line[0]=='#'||line[0]=='\n')continue;char name[4096],sha[65],orig[65];unsigned long long size=0;
-  need(sscanf(line,"%4095[^\t]\t%llu\t%64[0-9a-f]\t%64[0-9a-f-]",name,&size,sha,orig)==4&&strlen(sha)==64&&(strlen(orig)==64||!strcmp(orig,"-")),"RomFS overlay manifest line");
-  need(path_ok(name),"RomFS overlay path");uint64_t i=lower(name);int known=i<file_count&&!strcmp(entry_name(entry(i)),name),add=!strcmp(orig,"-");
-  if(!known&&!add){fprintf(stderr,"[totk] RomFS overlay: %s/manifest.tsv names %s, which the RomFS lacks; a new file has \"-\" as its original's SHA-256\n",dir,name);runtime_fail("RomFS overlay names a file the RomFS lacks");}
-  if(known&&add){fprintf(stderr,"[totk] RomFS overlay: %s/manifest.tsv adds %s, which the RomFS already has; give its original's SHA-256\n",dir,name);runtime_fail("RomFS overlay adds a file the RomFS already has");}
-  Entry e={0};if(known){e=entry(i);sha_range(image_fd,e.offset,e.size,orig,"original");}else i=ADDED;
+  /* The original's field: its SHA-256 (checked against the game), "-" (a new file), or "*" (replace or add, the original
+     not checked: the iPhone / iPad launcher's mods, which cannot hash the packed RomFS; the mod file itself still is). */
+  need(sscanf(line,"%4095[^\t]\t%llu\t%64[0-9a-f]\t%64[0-9a-f*-]",name,&size,sha,orig)==4&&strlen(sha)==64&&(strlen(orig)==64||!strcmp(orig,"-")||!strcmp(orig,"*")),"RomFS overlay manifest line");
+  need(path_ok(name),"RomFS overlay path");uint64_t i=lower(name);int known=i<file_count&&!strcmp(entry_name(entry(i)),name),any=!strcmp(orig,"*"),add=!strcmp(orig,"-")||(any&&!known);
+  if(!known&&!add&&!any){fprintf(stderr,"[totk] RomFS overlay: %s/manifest.tsv names %s, which the RomFS lacks; a new file has \"-\" as its original's SHA-256\n",dir,name);runtime_fail("RomFS overlay names a file the RomFS lacks");}
+  if(known&&add&&!any){fprintf(stderr,"[totk] RomFS overlay: %s/manifest.tsv adds %s, which the RomFS already has; give its original's SHA-256\n",dir,name);runtime_fail("RomFS overlay adds a file the RomFS already has");}
+  Entry e={0};if(known){e=entry(i);if(!any)sha_range(image_fd,e.offset,e.size,orig,"original");}else i=ADDED;
   char file[8200];need(snprintf(file,sizeof(file),"%s/%s",dir,name)<(int)sizeof(file),"RomFS overlay file path");int fd=open(file,O_RDONLY|O_CLOEXEC);struct stat st;
   need(fd>=0&&fstat(fd,&st)==0&&(uint64_t)st.st_size==size,"RomFS overlay file missing or wrong size");sha_range(fd,0,size,sha,name);close(fd);
   hashed+=e.size+size;

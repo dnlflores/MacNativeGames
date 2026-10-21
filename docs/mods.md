@@ -28,7 +28,14 @@ Only the files listed in `manifest.tsv` are served. Each line has four tab-separ
 
 At startup the loader checks each listed file's size and SHA-256, and checks the original's SHA-256
 against the game image. `-` in the last field adds a file the game's RomFS does not have (used by mods
-that add assets). Paths are case-sensitive and keep the RomFS spelling.
+that add assets). `*` in the last field replaces the file if the RomFS has it and adds it otherwise,
+without checking the original (the iPhone / iPad start screen writes this: it cannot hash files inside
+the packed RomFS; the mod file itself is still checked). Paths are case-sensitive and keep the RomFS
+spelling.
+
+On iPhone and iPad, the start screen's **Mods** section manages this for you: put each mod in its own
+folder under `Mods` (Files app, On My iPad, the game), switch it on, and press Play. Enabled mods are
+linked into one folder with a generated manifest; a lower mod in the list wins a path both change.
 
 A folder without `manifest.tsv` means "no mod". Files copied into the folder but not listed are not
 used. In detail:

@@ -5,11 +5,13 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <math.h>
 #include "runtime.h"
 #include "dmsh_chain.h"
 #import "touch_pad.h"
+#import "launcher.h"
 
 int totk_host_main(int argc, char **argv);
 void runtime_ios_attach_layer(CAMetalLayer *layer, UIView *host);
@@ -64,7 +66,23 @@ void runtime_shortcut_help_toggle(void) {}
     (void)session; (void)options;
     if (![scene isKindOfClass:UIWindowScene.class]) return;
     self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
-    self.window.rootViewController = [TOTKGameController new]; [self.window makeKeyAndVisible];
+    /* The start screen first (launcher.m); Play hands the window to the game. TOTK_SKIP_LAUNCHER=1 (test launches)
+       starts the game at once with the saved options. */
+    const char *skip = getenv("TOTK_SKIP_LAUNCHER");
+    if (skip && !strcmp(skip, "1")) {
+        NSString *err = totk_launcher_apply();
+        if (err) fprintf(stderr, "[launcher] %s\n", err.UTF8String);
+        self.window.rootViewController = [TOTKGameController new];
+    } else {
+        TOTKLauncherController *launcher = [TOTKLauncherController new];
+        __weak UIWindow *window = self.window;
+        launcher.onPlay = ^{
+            [UIView transitionWithView:window duration:0.35 options:UIViewAnimationOptionTransitionCrossDissolve
+                            animations:^{ window.rootViewController = [TOTKGameController new]; } completion:nil];
+        };
+        self.window.rootViewController = launcher;
+    }
+    [self.window makeKeyAndVisible];
 }
 @end
 
@@ -117,23 +135,8 @@ static void audio_observe(void) {
     NSString *log = [docs stringByAppendingPathComponent:@"log.txt"];
     if (freopen(log.fileSystemRepresentation,"w",stderr)) setvbuf(stderr,NULL,_IOLBF,0);
     setenv("TOTK_ROMFS",[res stringByAppendingPathComponent:@"romfs"].fileSystemRepresentation,1);
-    /* Graphics (Settings app > this game > Graphics; Sources/Settings.bundle), read at launch:
-       handheld   - the Switch's handheld mode: 1280x720 (the default, as before)
-       docked     - docked mode: Breath of the Wild renders 1920x1080 (game_patches_botw.c), Tears of the Kingdom its docked
-                    1600x900 into a 1080p picture; the drawable is 1080 rows, so the system scales it to the screen
-       docked-mfx - docked, and MetalFX upscales the 1080p picture to the screen's own pixels (the Mac's 2K output stage,
-                    totk_mfx_up.m MFXUP_OUTPUT) instead of the system's bilinear stretch
-       native-1440, native-2160 (Breath of the Wild) - docked, the game itself renders and lays out 2560x1440 / 3840x2160
-                    (TOTK_BOTW_RES, game_patches_botw.c patch_display); the drawable has the screen's own pixels, so a
-                    picture bigger than the screen is scaled down (4K: supersampled)
-       A test launch's environment (devicectl --environment-variables) still wins over the setting. */
-    NSString *graphics = [NSUserDefaults.standardUserDefaults stringForKey:@"graphics"] ?: @"handheld";
-    NSString *native = [graphics isEqualToString:@"native-1440"] ? @"2560x1440" : [graphics isEqualToString:@"native-2160"] ? @"3840x2160" : nil;
-    BOOL docked = native || [graphics isEqualToString:@"docked"] || [graphics isEqualToString:@"docked-mfx"];
-    setenv("TOTK_OPERATION_MODE", docked ? "docked" : "handheld", 0);
-    if ([graphics isEqualToString:@"docked-mfx"]) { setenv("TOTK_IOS_DRAWABLE_H","0",0); setenv("TOTK_MFX_UPSCALE","1",0); setenv("TOTK_MFX_OUTPUT","1",0); }
-    else if (native) { setenv("TOTK_BOTW_RES",native.UTF8String,0); setenv("TOTK_IOS_DRAWABLE_H","0",0); }
-    else if (docked) setenv("TOTK_IOS_DRAWABLE_H","1080",0);
+    /* The player's options (graphics, enhancements, controls, mods) are set by the start screen when Play is pressed
+       (launcher.m totk_launcher_apply). */
     setenv("TOTK_ROMFS_PATCHES",[res stringByAppendingPathComponent:@"romfs-patches"].fileSystemRepresentation,1);
     setenv("TOTK_ROMFS_PATCHES_OUT",[res stringByAppendingPathComponent:@"romfs-patches-out"].fileSystemRepresentation,1);
     setenv("TOTK_SHARED_FONTS",[res stringByAppendingPathComponent:@"shared-fonts"].fileSystemRepresentation,1);
