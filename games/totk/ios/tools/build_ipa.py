@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Build an unsigned, sideloadable iPhone/iPad IPA from a prepared TOTK (or Breath of the Wild, --version botw160) work tree."""
-import argparse, hashlib, json, os, shutil, subprocess, sys
+import argparse, hashlib, json, os, shutil, subprocess, sys, tempfile
 from pathlib import Path
 from compile_seed import METAL_FLAGS
 from xcode_dir import developer_dir
@@ -65,6 +65,22 @@ def main():
     elif a.version=='v143': project=project.replace('          - loader.c','          - loader.c\n          - game_patches.c')
     else: project=project.replace('          - loader.c','          - loader.c\n          - game_patches_v143.c')
     if a.version!='v0' and not botw: project=project.replace('-I../build\n','-I../build -DTOTK_GAME_'+a.version.upper()+'=1\n')
+    # The app icon: the game's own (build/AppIcon.icns, made by build_app.py from the player's game file with
+    # scripts/extract_app_icon.py; never in the repository), as a one-size asset catalog (Xcode makes the other sizes).
+    icns=tree/'build/AppIcon.icns'
+    if icns.is_file():
+        catalog=gen/'Assets.xcassets'; icon_set=catalog/'AppIcon.appiconset'
+        shutil.rmtree(catalog,ignore_errors=True); icon_set.mkdir(parents=True)
+        with tempfile.TemporaryDirectory() as t:
+            subprocess.run(['iconutil','-c','iconset',str(icns),'-o',f'{t}/icon.iconset'],check=True)
+            # the 1024 px image, opaque (iOS fills transparency with black)
+            subprocess.run(['sips','-s','format','png','-s','formatOptions','normal',f'{t}/icon.iconset/icon_512x512@2x.png','--out',str(icon_set/'AppIcon.png')],check=True,capture_output=True)
+        (catalog/'Contents.json').write_text(json.dumps({'info':{'author':'xcode','version':1}}))
+        (icon_set/'Contents.json').write_text(json.dumps({'images':[{'filename':'AppIcon.png','idiom':'universal','platform':'ios','size':'1024x1024'}],
+                                                           'info':{'author':'xcode','version':1}}))
+        project=project.replace('      - path: Gen/embed.S\n','      - path: Gen/embed.S\n      - path: Gen/Assets.xcassets\n')
+        project=project.replace('      CODE_SIGN_STYLE: Manual\n','      CODE_SIGN_STYLE: Manual\n      ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon\n')
+    else: print(f'no app icon ({icns} missing): the app gets the system placeholder')
     (ios/'project.generated.yml').write_text(project)
     # Build device dependencies separately: Homebrew's Mac archives cannot be linked into an iOS application.
     deps=tree/'build/ios-deps'
