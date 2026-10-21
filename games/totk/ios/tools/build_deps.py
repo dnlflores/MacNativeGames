@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Build the audio and VP9 static libraries for a physical iOS device."""
-import os, subprocess, sys
+import hashlib, os, subprocess, sys, tempfile
 from pathlib import Path
 
 out = Path(sys.argv[1]).resolve(); out.mkdir(parents=True, exist_ok=True)
+# libvpx's configure splits its flags and paths at spaces (a game folder often has them), so work through a link without
+work = out
+if any(c.isspace() for c in str(out)):
+    work = Path(tempfile.gettempdir())/f'mng-ios-deps-{hashlib.sha256(str(out).encode()).hexdigest()[:12]}'
+    if work.is_symlink(): work.unlink()
+    work.symlink_to(out)
 sdk = subprocess.check_output(['xcrun','--sdk','iphoneos','--show-sdk-path'], text=True).strip()
-src = out/'src'; build = out/'build'; src.mkdir(exist_ok=True); build.mkdir(exist_ok=True)
-sdklink=out/'sdkroot/Platforms/iPhoneOS.platform/Developer/SDKs'/Path(sdk).name
+src = work/'src'; build = work/'build'; src.mkdir(exist_ok=True); build.mkdir(exist_ok=True)
+sdklink=work/'sdkroot/Platforms/iPhoneOS.platform/Developer/SDKs'/Path(sdk).name
 if sdklink.is_symlink(): sdklink.unlink()
 sdklink.parent.mkdir(parents=True,exist_ok=True)
 if not sdklink.exists(): sdklink.symlink_to(sdk)

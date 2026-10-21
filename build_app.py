@@ -242,6 +242,9 @@ def prerequisites(args):
         raise BuildError(f'Homebrew packages missing: brew install {" ".join(missing)}')
     if not shutil.which('git', path=os.pathsep.join(TOOL_PATHS + ['/usr/bin'])):
         raise BuildError('git not found: xcode-select --install')
+    # The IPA's startup shaders are compiled for the device (ios/tools/compile_seed.py); the Mac build only falls back to Metal's cache
+    if getattr(args, 'platform', None) == 'ios' and subprocess.run(['xcrun', '-sdk', 'iphoneos', 'metal', '--version'], capture_output=True).returncode:
+        raise BuildError('the iOS build needs Xcode\'s Metal toolchain: xcodebuild -downloadComponent MetalToolchain')
     py = next((p for p in (shutil.which(n, path=os.pathsep.join(TOOL_PATHS)) for n in ('python3.14', 'python3.15')) if p), None)
     if not py:
         raise BuildError('Python 3.14 not found (the build reads zstd with the standard library): brew install python@3.14')
