@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The game's page in the Settings app; read at launch by Sources/main.m (key "graphics"). -->
+<plist version="1.0">
+<dict>
+	<key>PreferenceSpecifiers</key>
+	<array>
+		<dict>
+			<key>Type</key><string>PSGroupSpecifier</string>
+			<key>Title</key><string>Graphics</string>
+			<key>FooterText</key><string>Takes effect the next time the game starts. Docked renders at 1920x1080 (Breath of the Wild) and uses more battery and heat; MetalFX then upscales the picture to this screen's full resolution.</string>
+		</dict>
+		<dict>
+			<key>Type</key><string>PSMultiValueSpecifier</string>
+			<key>Title</key><string>Resolution</string>
+			<key>Key</key><string>graphics</string>
+			<key>DefaultValue</key><string>handheld</string>
+			<key>Titles</key>
+			<array>
+				<string>Handheld, 1280x720</string>
+				<string>Docked, 1920x1080</string>
+				<string>Docked + MetalFX to screen</string>
+			</array>
+			<key>Values</key>
+			<array>
+				<string>handheld</string>
+				<string>docked</string>
+				<string>docked-mfx</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

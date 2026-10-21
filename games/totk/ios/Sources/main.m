@@ -117,7 +117,18 @@ static void audio_observe(void) {
     NSString *log = [docs stringByAppendingPathComponent:@"log.txt"];
     if (freopen(log.fileSystemRepresentation,"w",stderr)) setvbuf(stderr,NULL,_IOLBF,0);
     setenv("TOTK_ROMFS",[res stringByAppendingPathComponent:@"romfs"].fileSystemRepresentation,1);
-    setenv("TOTK_OPERATION_MODE","handheld",1);
+    /* Graphics (Settings app > this game > Graphics; Sources/Settings.bundle), read at launch:
+       handheld   - the Switch's handheld mode: 1280x720 (the default, as before)
+       docked     - docked mode: Breath of the Wild renders 1920x1080 (game_patches_botw.c), Tears of the Kingdom its docked
+                    1600x900 into a 1080p picture; the drawable is 1080 rows, so the system scales it to the screen
+       docked-mfx - docked, and MetalFX upscales the 1080p picture to the screen's own pixels (the Mac's 2K output stage,
+                    totk_mfx_up.m MFXUP_OUTPUT) instead of the system's bilinear stretch
+       A test launch's environment (devicectl --environment-variables) still wins over the setting. */
+    NSString *graphics = [NSUserDefaults.standardUserDefaults stringForKey:@"graphics"] ?: @"handheld";
+    BOOL docked = [graphics isEqualToString:@"docked"] || [graphics isEqualToString:@"docked-mfx"];
+    setenv("TOTK_OPERATION_MODE", docked ? "docked" : "handheld", 0);
+    if ([graphics isEqualToString:@"docked-mfx"]) { setenv("TOTK_IOS_DRAWABLE_H","0",0); setenv("TOTK_MFX_UPSCALE","1",0); setenv("TOTK_MFX_OUTPUT","1",0); }
+    else if (docked) setenv("TOTK_IOS_DRAWABLE_H","1080",0);
     setenv("TOTK_ROMFS_PATCHES",[res stringByAppendingPathComponent:@"romfs-patches"].fileSystemRepresentation,1);
     setenv("TOTK_ROMFS_PATCHES_OUT",[res stringByAppendingPathComponent:@"romfs-patches-out"].fileSystemRepresentation,1);
     setenv("TOTK_SHARED_FONTS",[res stringByAppendingPathComponent:@"shared-fonts"].fileSystemRepresentation,1);
