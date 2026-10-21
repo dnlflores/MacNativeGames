@@ -7,6 +7,18 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RyuSrc Condition="'$(RyuSrc)' == ''">$(MSBuildThisFileDirectory)../../tooling/d2r-mobile/dm/third_party/ryujinx</RyuSrc>
   </PropertyGroup>
+  <!-- iPhone / iPad (publish_ios.sh): a static library with the service's entry points; SPIRV-Cross linked in, not started -->
+  <PropertyGroup Condition="'$(TotkXlateLib)' == 'true'">
+    <OutputType>Library</OutputType>
+    <NativeLib>Static</NativeLib>
+    <DefineConstants>$(DefineConstants);TOTK_XLATE_LIB</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(TotkXlateLib)' == 'true'">
+    <DirectPInvoke Include="totk_spvc" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TotkXlateLib)' != 'true'">
+    <Compile Remove="Library.cs" />
+  </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="$(RyuSrc)/src/Ryujinx.Graphics.Shader/Ryujinx.Graphics.Shader.csproj" />
     <ProjectReference Include="$(RyuSrc)/src/Ryujinx.Common/Ryujinx.Common.csproj" />

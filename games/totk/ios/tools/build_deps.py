@@ -48,7 +48,18 @@ run([str(vpx/'configure'),'--target=arm64-darwin-gcc','--disable-examples','--di
      '--disable-docs','--disable-unit-tests','--disable-webm-io','--enable-pic','--disable-shared','--enable-static',
      f'--extra-cflags=-target arm64-apple-ios26.0 -isysroot {sdklink} -miphoneos-version-min=26.0'], cwd=vpxout, env=vpx_env)
 run(['make','-j',str(os.cpu_count() or 4),'libvpx.a'],cwd=vpxout,env=vpx_env)
+# SPIRV-Cross for the in-app shader translator (tools/totk_xlate/Library.cs): the pinned sources of the Mac's spirv-cross
+# program (build_app.py SPIRV_CROSS_SOURCES / FLAGS) with ios/spvc/totk_spvc.cpp in place of its main.cpp
+totk=Path(__file__).resolve().parents[2]; spvc_src=totk/'tooling/spirv-cross'; spvc_obj=build/'spirv-cross'; spvc_obj.mkdir(exist_ok=True)
+spvc_flags=['-O3','-DNDEBUG','-std=c++11','-target','arm64-apple-ios26.0','-isysroot',str(sdklink),'-Wno-deprecated-declarations']
+spvc_units=[spvc_src/f'{n}.cpp' for n in ('spirv_cfg','spirv_cpp','spirv_cross','spirv_cross_parsed_ir','spirv_cross_util','spirv_glsl',
+                                         'spirv_hlsl','spirv_msl','spirv_parser','spirv_reflect')]+[totk/'ios/spvc/totk_spvc.cpp']
+import concurrent.futures
+with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as pool:
+    list(pool.map(lambda u: run(['xcrun','clang++',*spvc_flags,'-I',str(spvc_src),'-c',str(u),'-o',str(spvc_obj/(u.stem+'.o'))]),spvc_units))
 lib=out/'lib'; include=out/'include'; lib.mkdir(exist_ok=True); include.mkdir(exist_ok=True)
+(lib/'libtotk_spvc.a').unlink(missing_ok=True)
+run(['libtool','-static','-o',str(lib/'libtotk_spvc.a'),*[str(spvc_obj/(u.stem+'.o')) for u in spvc_units]])
 import shutil
 shutil.copy2(opus_build/'libopus.a',lib/'libopus.a')
 shutil.copy2(vpxout/'libvpx.a',lib/'libvpx.a')

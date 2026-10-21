@@ -286,6 +286,27 @@ static class ShaderService
         return bad;
     }
 
+#if TOTK_XLATE_LIB
+    // The iPhone / iPad library (Library.cs) cannot start a program: SPIRV-Cross's own main() is linked in instead,
+    // called with the same arguments as the Mac's spirv-cross program (games/totk/ios/tools/totk_spvc_main.cpp).
+    [System.Runtime.InteropServices.DllImport("totk_spvc", EntryPoint = "totk_spvc_run")]
+    static extern unsafe int SpvcRun(int argc, byte** argv);
+
+    static unsafe void SpirvCross(string spv, string msl, string what)
+    {
+        var args = new List<string> { "spirv-cross" }; args.AddRange(Xc); args.Add(spv); args.Add("--output"); args.Add(msl);
+        var bytes = args.Select(a => Encoding.UTF8.GetBytes(a + "\0")).ToArray();
+        var handles = bytes.Select(b => System.Runtime.InteropServices.GCHandle.Alloc(b, System.Runtime.InteropServices.GCHandleType.Pinned)).ToArray();
+        try
+        {
+            byte** argv = stackalloc byte*[bytes.Length + 1];
+            for (int i = 0; i < bytes.Length; i++) argv[i] = (byte*)handles[i].AddrOfPinnedObject();
+            argv[bytes.Length] = null;
+            if (SpvcRun(bytes.Length, argv) != 0) throw new RuntimeError(what + "failed (" + Path.GetFileName(spv) + ")");
+        }
+        finally { foreach (var h in handles) h.Free(); }
+    }
+#else
     static void SpirvCross(string spv, string msl, string what)
     {
         var psi = new ProcessStartInfo(spirvCross) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
@@ -297,6 +318,7 @@ static class ShaderService
         if (p.ExitCode != 0) throw new RuntimeError(what + Cut(err.Result.Trim(), 300));
         _ = outp.Result;
     }
+#endif
 
     static void Translate(JsonObject job)
     {
@@ -474,20 +496,30 @@ static class ShaderService
         while ((line = Console.In.ReadLine()) != null)
         {
             if (line.Trim().Length == 0) continue;
-            string reply;
-            try
-            {
-                Handle(JsonNode.Parse(line).AsObject());
-                reply = "{\"ok\": true}";
-            }
-            catch (Exception e)   // reported to the host, which stops with the message
-            {
-                string kind = e is RuntimeError ? "RuntimeError" : e.GetType().Name;
-                reply = PyJson(new JsonObject { ["ok"] = false, ["error"] = Cut($"{kind}: {e.Message}", 500) }, -1, true);
-            }
-            stdout.Write(reply + "\n");
+            stdout.Write(HandleLine(line) + "\n");
             stdout.Flush();
         }
         return 0;
+    }
+
+    // One request line -> its reply line; the service loop above and the iPhone / iPad library (Library.cs) share it.
+    internal static string HandleLine(string line)
+    {
+        try
+        {
+            Handle(JsonNode.Parse(line).AsObject());
+            return "{\"ok\": true}";
+        }
+        catch (Exception e)   // reported to the host, which stops with the message
+        {
+            string kind = e is RuntimeError ? "RuntimeError" : e.GetType().Name;
+            return PyJson(new JsonObject { ["ok"] = false, ["error"] = Cut($"{kind}: {e.Message}", 500) }, -1, true);
+        }
+    }
+
+    internal static void Configure(string outDirectory, string chainName, int debug)
+    {
+        outDir = outDirectory; chain = chainName; debugMode = debug;
+        Directory.CreateDirectory(outDir);
     }
 }

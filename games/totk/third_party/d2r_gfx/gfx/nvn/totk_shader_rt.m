@@ -36,7 +36,9 @@ extern char **environ;
 static pthread_mutex_t g_rt_lock = PTHREAD_MUTEX_INITIALIZER;
 static NSMutableDictionary<NSString *, NSMutableArray<NSDictionary *> *> *g_variants;
 static NSMutableSet<NSString *> *g_msl_checked;
+#if !TARGET_OS_IPHONE
 static FILE *g_svc_in, *g_svc_out;
+#endif
 static NSString *g_root, *g_dir;
 /* iOS: the seed inside the signed app is read where it is instead of being copied into the cache (totk_shader_seed.h
    totk_seed_sealed). Its files are taken from there; the cache holds the rest (fill packs, pso_collected.tsv), and a
@@ -145,6 +147,47 @@ NSSet<NSString *> *totk_rt_shader_scope(void) {
     return [[NSSet setWithArray:scope[@"keys"]] setByAddingObjectsFromSet:totk_rt_observed_shader_keys()];
 }
 
+#if TARGET_OS_IPHONE
+/* iPhone / iPad: the same service linked into the app (tools/totk_xlate/Library.cs, prebuilt/ios-arm64; SPIRV-Cross's
+   main() linked in too, ios/spvc/totk_spvc.cpp), as the app cannot start a program. Same requests, replies and cache
+   files as the Mac's totk_xlate --service; called under g_rt_lock, one request at a time. */
+int totk_xlate_init(const char *out, const char *chain, int debug_mode);
+int totk_xlate_request(const char *line, char *reply, int cap);
+static int g_xlate_ready;
+static void service_start(void) {
+    if (g_xlate_ready) return;
+    const char *dm = getenv("TOTK_SHADER_DEBUGMODE");
+    if (totk_xlate_init(totk_rt_dir().fileSystemRepresentation, DMSH_CHAIN, dm && *dm ? atoi(dm) : 1)) die("shader translator: cannot use %s", totk_rt_dir().UTF8String);
+    g_xlate_ready = 1;
+    LOG("[shader] runtime translation in the app (prebuilt/ios-arm64 libtotk_xlate.a), cache %s", totk_rt_dir().UTF8String);
+}
+/* The translator recurses through a shader's control flow: it runs on its own thread with the 8 MB stack the Mac's
+   service process has (the game's threads on iOS have 512 KB), and the caller waits for it. */
+static struct { const char *request; char *reply; int cap; } g_xlate_job;
+static dispatch_semaphore_t g_xlate_go, g_xlate_done;
+static void *xlate_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        dispatch_semaphore_wait(g_xlate_go, DISPATCH_TIME_FOREVER);
+        totk_xlate_request(g_xlate_job.request, g_xlate_job.reply, g_xlate_job.cap);
+        dispatch_semaphore_signal(g_xlate_done);
+    }
+    return NULL;
+}
+static void service_call(NSString *request, char *line, size_t cap) {
+    service_start();
+    if (!g_xlate_go) {
+        g_xlate_go = dispatch_semaphore_create(0); g_xlate_done = dispatch_semaphore_create(0);
+        pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 8u << 20);
+        pthread_attr_set_qos_class_np(&at, QOS_CLASS_USER_INTERACTIVE, 0);   // the game's submit thread waits for it
+        pthread_t t; if (pthread_create(&t, &at, xlate_thread, NULL)) die("shader translator thread");
+        pthread_attr_destroy(&at);
+    }
+    g_xlate_job.request = request.UTF8String; g_xlate_job.reply = line; g_xlate_job.cap = (int)cap;
+    dispatch_semaphore_signal(g_xlate_go);
+    dispatch_semaphore_wait(g_xlate_done, DISPATCH_TIME_FOREVER);
+}
+#else
 static void service_start(void) {
     if (g_svc_in) return;
     NSString *r = root_dir();
@@ -183,6 +226,12 @@ static void service_start(void) {
     LOG("[shader] runtime translation service started (pid %d, %s), cache %s", pid,
         use_native ? "native build/shader-service/totk_xlate" : "python3 scripts/shader_service.py + .NET", totk_rt_dir().UTF8String);
 }
+static void service_call(NSString *request, char *line, size_t cap) {
+    service_start();
+    fprintf(g_svc_in, "%s\n", request.UTF8String); fflush(g_svc_in);
+    if (!fgets(line, (int)cap, g_svc_out)) die("shader service exited while translating");
+}
+#endif
 
 static NSString *hex(const uint8_t *p, size_t n) {
     NSMutableString *s = [NSMutableString stringWithCapacity:n * 2];
@@ -235,16 +284,12 @@ static int deps_match(NSDictionary *deps, NSDictionary *ans) {
     return 1;
 }
 
-/* No translator: the iPhone / iPad, or TOTK_SHADER_NO_TRANSLATE=1 on the Mac (tests: what a device with only the prepared
-   shaders would skip, with the same miss records and skipped draws). */
+/* No translator: TOTK_SHADER_NO_TRANSLATE=1 (tests: what a device with only the prepared shaders would skip, with the
+   same miss records and skipped draws; on the iPhone / iPad also the way back to recording requests for fill_shaders.py). */
 static int no_translator(void) {
-#if TARGET_OS_IPHONE
-    return 1;
-#else
     static int v = -1;
     if (v < 0) { const char *e = getenv("TOTK_SHADER_NO_TRANSLATE"); v = e && !strcmp(e, "1"); }
     return v;
-#endif
 }
 NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers, NSArray *local) {
     uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -304,15 +349,20 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
     return nil;
     }
     BOOL existed = [NSFileManager.defaultManager fileExistsAtPath:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.metal", variant]];   // a re-translation of a broken variant is not a new one
-    service_start();
-    fprintf(g_svc_in, "%s\n", json_string(rq).UTF8String); fflush(g_svc_in);
     char line[2048];
-    if (!fgets(line, sizeof line, g_svc_out)) die("shader service exited while translating %s", variant.UTF8String);
+    service_call(json_string(rq), line, sizeof line);
     NSDictionary *reply = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:line length:strlen(line)] options:0 error:nil];
     if (![reply[@"ok"] boolValue]) {
         LOG("[survey-shader] frame %llu translation FAILED %s %s after %.2f ms: %s",
             (unsigned long long)dm_nvn_frame_count(), stage_name.UTF8String, variant.UTF8String,
             (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started) / 1e6, [[reply[@"error"] description] UTF8String]);
+#if TARGET_OS_IPHONE
+        // The player's game goes on without the draws that need it (as for a miss); the caller remembers the miss.
+        LOG("[shader] translation failed, its draws are skipped: %s %s: %s", stage_name.UTF8String, variant.UTF8String,
+            [[reply[@"error"] description] UTF8String]);
+        pthread_mutex_unlock(&g_rt_lock);
+        return nil;
+#endif
         die("shader %s (%s) translation failed: %s", variant.UTF8String, stage_name.UTF8String, [[reply[@"error"] description] UTF8String]);
     }
     NSData *jd = [NSData dataWithContentsOfFile:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.json", variant]];

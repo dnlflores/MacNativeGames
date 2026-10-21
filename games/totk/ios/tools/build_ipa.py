@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Build an unsigned, sideloadable iPhone/iPad IPA from a prepared TOTK (or Breath of the Wild, --version botw160) work tree."""
-import argparse, json, os, shutil, subprocess, sys
+import argparse, hashlib, json, os, shutil, subprocess, sys
 from pathlib import Path
 from compile_seed import METAL_FLAGS
 from xcode_dir import developer_dir
@@ -33,6 +33,7 @@ def main():
     p.add_argument('--version',choices=['v0','v112','v121','v143','botw160'],required=True);p.add_argument('--logs',type=Path,required=True)
     p.add_argument('--app-name',default='Tears of the Kingdom');p.add_argument('--bundle-id',default='org.macnativegames.totk')
     p.add_argument('--shader-list',type=Path,help="the game's shared shader list (default: Tears of the Kingdom's)")
+    p.add_argument('--no-ipa',action='store_true',help='stop once the app is assembled (build/ios-derived), for installing it directly')
     a=p.parse_args(); tree=a.tree.resolve(); ios=tree/'ios';gen=ios/'Gen';logs=a.logs.resolve(); out=a.out.resolve()
     botw=a.version=="botw160"
     if out.suffix.lower()!='.ipa': raise RuntimeError('iOS output path must end in .ipa')
@@ -70,10 +71,17 @@ def main():
     run([sys.executable,ios/'tools/build_deps.py',deps],tree,logs/'ios-dependencies.log',env)
     shutil.copytree(deps/'include',gen/'deps/include',dirs_exist_ok=True)
     (gen/'deps/lib').mkdir(parents=True,exist_ok=True)
-    for lib in ('libopus.a','libvpx.a'): clone(deps/'lib'/lib,gen/'deps/lib'/lib)
+    for lib in ('libopus.a','libvpx.a','libtotk_spvc.a'): clone(deps/'lib'/lib,gen/'deps/lib'/lib)
+    # The in-app shader translator (tools/totk_xlate/publish_ios.sh): checked like the Mac's prebuilt totk_xlate
+    xlate=tree/'prebuilt/ios-arm64'
+    for line in (xlate/'SHA256SUMS').read_text().splitlines():
+        want,name=line.split()
+        if hashlib.sha256((xlate/name).read_bytes()).hexdigest()!=want:
+            raise RuntimeError(f'{xlate/name}: not the shader translator this repository ships (SHA-256 differs from SHA256SUMS); '
+                               'check it out again, or rebuild it with games/totk/tools/totk_xlate/publish_ios.sh')
+        clone(xlate/name,gen/'deps/lib'/name)
     seed_src=tree/f'build/shader-seed/{a.version}'; seed=gen/'totk/shader-seed'
     if not (seed_src/'seed-manifest.json').is_file(): raise RuntimeError(f'missing verified shader seed: {seed_src}')
-    import hashlib
     source_manifest_hash=hashlib.sha256((seed_src/'seed-manifest.json').read_bytes()).hexdigest()
     expected_metallibs=sum(name.endswith('_b.metal') for name in json.loads((seed_src/'seed-manifest.json').read_text())['files'])
     cached_manifest=seed/'seed-manifest.json'
@@ -103,7 +111,7 @@ def main():
     env.update(TOTK_APP_NAME=a.app_name,TOTK_BUNDLE_ID=a.bundle_id)
     xcconfig=gen/'totk.xcconfig'
     frameworks=' '.join('-framework '+x for x in ['UIKit','Metal','MetalFX','Foundation','QuartzCore','ImageIO','CoreGraphics','CoreText','UniformTypeIdentifiers','CoreFoundation','AudioToolbox','GameController','AVFAudio','Security'])
-    xcconfig.write_text(f'OTHER_LDFLAGS = $(inherited) {frameworks} Gen/deps/lib/libopus.a Gen/deps/lib/libvpx.a {flags}\n')
+    xcconfig.write_text(f'OTHER_LDFLAGS = $(inherited) {frameworks} Gen/deps/lib/libopus.a Gen/deps/lib/libvpx.a Gen/deps/lib/libtotk_xlate.a Gen/deps/lib/libtotk_xlate_boot.o Gen/deps/lib/libtotk_spvc.a -lc++ {flags}\n')
     run(['xcodegen','generate','--spec','project.generated.yml'],ios,logs/'xcodegen.log',env)
     derived=tree/'build/ios-derived';run(['xcodebuild','-project','TOTKIOS.xcodeproj','-scheme','TOTKIOS','-configuration','Release',
         '-destination','generic/platform=iOS','-derivedDataPath',derived,'CODE_SIGNING_ALLOWED=NO','CODE_SIGNING_REQUIRED=NO','CODE_SIGN_IDENTITY='],
@@ -130,6 +138,8 @@ def main():
     # Exported from the one shared shader list (games/totk/assets/shader_list.tsv, docs/shader-list.md).
     run([sys.executable,tree/'scripts/shader_list.py','export',a.shader_list or tree/'assets/shader_list.tsv',logs/'pso_manifest.tsv',
          res/'shader-seed/pso_title.tsv'],tree,logs/'shader-list.log',env)
+    if a.no_ipa:   # development: install this app directly (devicectl), without the zip of the whole game
+        print(f'app ready (no IPA): {app}'); return
     # Keep the player's first install self-contained; the app stores saves and writable shader cache in Documents.
     payload=tree/'build/ios-payload';shutil.rmtree(payload,ignore_errors=True);(payload/'Payload').mkdir(parents=True)
     copy_tree(app,payload/'Payload/TOTK.app')
