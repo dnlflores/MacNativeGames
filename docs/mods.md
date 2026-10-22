@@ -1,5 +1,68 @@
 # Player mods (RomFS)
 
+## Tears of the Kingdom on iPhone / iPad
+
+The TotK start screen has the same automatic ZIP/RAR installer described below, with links to
+[GameBanana](https://gamebanana.com/games/7617) and
+[Nexus Mods](https://www.nexusmods.com/games/legendofzeldatearsofthekingdom/mods).
+Open **Mods**, browse either site, and tap a supported ZIP or RAR download to install and enable it.
+The installed game version is shown in the instructions: choose a RomFS mod for that exact version
+(the owner's prepared iPad build is 1.1.2). Version compatibility cannot be inferred from arbitrary
+asset files, so the installer validates package structure rather than guaranteeing a mod will work.
+
+TotK Atmosphere downloads may wrap `romfs` in `atmosphere/contents/0100F2C0115B6000`.
+Archives with another game's title folder are rejected, as are mixed packages containing `exefs`,
+cheats/code patches or multiple RomFS variants. Emulator patches and graphics mods do not work here.
+The same archive limits, download/login flow and manual folder fallback below apply to both games.
+This port reserves some UI/heap files (see Notes below); mods replacing those can still fail at Play.
+
+## Breath of the Wild on iPhone / iPad
+
+The BotW 1.6.0 iOS source includes a start screen: open **Mods** before pressing **Play**.
+It supports base-game **Switch RomFS** replacements and additions. Compatibility must still be
+checked for each mod; being listed on a mod site does not make a download compatible with this port.
+
+The Mods screen links to [GameBanana's Switch section](https://gamebanana.com/games/6386) and
+[Nexus Mods](https://www.nexusmods.com/games/legendofzeldabreathofthewild/mods).
+These open an in-app WebKit browser. Tap the site's ZIP or RAR download to download, extract, validate,
+install and enable the mod automatically, then return to the Mods list. Nexus login, file selection,
+and any download steps required by the site still apply. External `nxm:` manager links are not
+supported; choose the site's manual ZIP or RAR download. The app does not bypass download permissions.
+
+Automatic installation accepts ZIP and RAR archives up to 512 MB compressed and 2 GB extracted, with no more than
+20,000 entries and exactly one nonempty `romfs` folder (including inside Atmosphere wrappers).
+Stored/deflated ZIPs and RAR/RAR5 archives are supported. RAR decoding uses pinned libarchive 3.8.9. Encrypted/split/ZIP64 archives, unsafe or duplicate paths,
+links, and packages containing code patches, DLC replacements or Wii U content are rejected. RAR extraction also has a two-minute time limit.
+Each successful download gets a new mod folder, preserving previous installs. Reinstalling a mod
+creates a separate entry; disable or delete the old entry in Mods. Multiple installed mods still
+follow the launcher's file replacement order, without content merging.
+
+For 7z downloads, unsupported package layouts, or a site that blocks embedded browsing, use
+the existing manual folder import:
+
+1. Download a mod explicitly made for Switch BotW 1.6.0 and extract the archive in Files
+   (use an archive app if Files cannot extract its format).
+2. Return to **Mods → Import a mod folder…**. Select the folder directly containing `romfs`,
+   or the `romfs` folder itself. For an Atmosphere package, select
+   `atmosphere/contents/01007EF00011E000`, rather than the whole extracted archive.
+3. Enable the imported mod, arrange its order, and press Play. A lower mod wins when two change
+   the same file; the launcher does not merge the contents of that file. Back up saves first.
+
+Limitations:
+
+- Wii U/Cemu mods are not directly compatible with this Switch build.
+- BNP and UKMM packages need to be processed/exported by their mod manager into Switch RomFS
+  files first. Installing these package formats directly is not supported.
+- `exefs`, IPS/pchtxt code patches, cheats, and emulator graphics packs are not loaded by this screen.
+- DLC has a separate reader (`runtime/aoc_romfs.c`) without a player-mod overlay. Mods requiring
+  replacements in DLC title `01007EF00011F001` are not fully supported, even if their base-game
+  files import successfully.
+- Large overhauls may need merging, resource-size-table changes, or runtime features this port
+  does not support. No individual downloaded mod has been tested by this change.
+
+These controls are part of the source build; an older installed app needs rebuilding and reinstalling
+to receive them.
+
 [English](#english) | [中文](#chinese)
 
 <a id="english"></a>
@@ -96,7 +159,7 @@ copying, or the removed files stay active. Generate the manifest again after eve
   "two overlays replace the same file"; leave that file out of the mod for now (UI translation mods hit this, #73).
 - `exefs/` is not loaded; only RomFS content works. (`TOTK_PCHTXT` is a developer experiment for pchtxt
   patches, not a general mod loader.)
-- This guide covers the Mac app; installing mods into the iPhone/iPad app container is not covered.
+- For iPhone/iPad imports, see the Breath of the Wild section above and the start screen's Mods section.
 
 <a id="chinese"></a>
 ## 中文

@@ -10,6 +10,8 @@
 #import "launcher.h"
 #import <GameController/GameController.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <WebKit/WebKit.h>
+#import "mod_zip.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -22,6 +24,20 @@ static const BOOL kBotW = YES;
 #else
 static const BOOL kBotW = NO;
 #endif
+
+static NSString *mod_game_version(void) {
+#if defined(GAME_BOTW)
+    return @"1.6.0";
+#elif defined(TOTK_GAME_V143)
+    return @"1.4.3";
+#elif defined(TOTK_GAME_V121)
+    return @"1.2.1";
+#elif defined(TOTK_GAME_V112)
+    return @"1.1.2";
+#else
+    return @"1.0.0";
+#endif
+}
 
 // ---------- storage ----------
 static NSString *docs(void) { return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject; }
@@ -489,6 +505,110 @@ static NSString *copy_in(NSURL *url, NSString *to, NSString **error) {
     return to;
 }
 
+/* Keep website login/download choices inside WebKit. WKDownload retains the site's cookies;
+   no API key, scraping or bypass of Nexus download permissions is involved. */
+@interface TLModBrowser : UIViewController <WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate>
+@property(nonatomic, strong) WKWebView *web;
+@property(nonatomic, strong) WKDownload *download;
+@property(nonatomic, strong) NSURL *archive;
+@property(nonatomic, copy) NSString *downloadName;
+@property(nonatomic, strong) NSTimer *timer;
+@property(nonatomic, copy) NSURL *site;
+@property(nonatomic, copy) void (^installed)(void);
+@end
+@implementation TLModBrowser
+- (void)viewDidLoad {
+    [super viewDidLoad]; self.title = @"Find a Switch RomFS mod";
+    self.web = [[WKWebView alloc] initWithFrame:self.view.bounds];
+    self.web.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.web.navigationDelegate = self; self.web.UIDelegate = self; [self.view addSubview:self.web];
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Back" style:UIBarButtonItemStylePlain target:self action:@selector(back)];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(close)];
+    [self.web loadRequest:[NSURLRequest requestWithURL:self.site]];
+}
+- (void)back { if (self.web.canGoBack) [self.web goBack]; }
+- (void)close {
+    [self.download cancel:nil]; self.download = nil; [self.timer invalidate]; self.timer = nil;
+    if (self.archive) [fm() removeItemAtURL:self.archive error:nil];
+    self.archive = nil; [self dismissViewControllerAnimated:YES completion:nil];
+}
+- (void)webView:(WKWebView *)web decidePolicyForNavigationAction:(WKNavigationAction *)action decisionHandler:(void (^)(WKNavigationActionPolicy))decide {
+    NSString *scheme = action.request.URL.scheme.lowercaseString;
+    if (![@[@"https", @"about"] containsObject:scheme]) {
+        decide(WKNavigationActionPolicyCancel);
+        alert(self, @"Use the website download", @"Choose a manual ZIP or RAR download. External mod-manager links cannot be installed by this app."); return;
+    }
+    decide(action.shouldPerformDownload ? WKNavigationActionPolicyDownload : WKNavigationActionPolicyAllow);
+}
+- (void)webView:(WKWebView *)web decidePolicyForNavigationResponse:(WKNavigationResponse *)response decisionHandler:(void (^)(WKNavigationResponsePolicy))decide {
+    NSString *mime = response.response.MIMEType.lowercaseString;
+    BOOL archive = [mime containsString:@"zip"] || [mime containsString:@"rar"] || [mime isEqualToString:@"application/octet-stream"] || !response.canShowMIMEType;
+    decide(archive ? WKNavigationResponsePolicyDownload : WKNavigationResponsePolicyAllow);
+}
+- (WKWebView *)webView:(WKWebView *)web createWebViewWithConfiguration:(WKWebViewConfiguration *)config forNavigationAction:(WKNavigationAction *)action windowFeatures:(WKWindowFeatures *)features {
+    if (!action.targetFrame) [web loadRequest:action.request]; return nil;
+}
+- (void)webView:(WKWebView *)web navigationAction:(WKNavigationAction *)action didBecomeDownload:(WKDownload *)download { download.delegate = self; }
+- (void)webView:(WKWebView *)web navigationResponse:(WKNavigationResponse *)response didBecomeDownload:(WKDownload *)download { download.delegate = self; }
+- (void)download:(WKDownload *)download decideDestinationUsingResponse:(NSURLResponse *)response suggestedFilename:(NSString *)filename completionHandler:(void (^)(NSURL *))completion {
+    if (self.download) { completion(nil); return; }
+    if (response.expectedContentLength > 512LL * 1024 * 1024 || ![@[@"zip", @"rar"] containsObject:filename.pathExtension.lowercaseString]) {
+        completion(nil); alert(self, @"Choose a supported archive", @"Automatic install supports ZIP and RAR files up to 512 MB containing one base-game Switch romfs folder. 7z, BNP and UKMM files need manual export/extraction."); return;
+    }
+    self.download = download; self.downloadName = filename.lastPathComponent.stringByDeletingPathExtension;
+    self.archive = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID.UUID.UUIDString stringByAppendingString:@".archive"]]];
+    self.modalInPresentation = YES; self.navigationController.modalInPresentation = YES;
+    self.title = @"Downloading mod…"; self.navigationItem.leftBarButtonItem.enabled = NO;
+    completion(self.archive);
+    __weak typeof(self) weak = self;
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
+        typeof(self) s = weak; if (!s) { [timer invalidate]; return; }
+        long long bytes = s.download.progress.completedUnitCount;
+        if (bytes > 512LL * 1024 * 1024) {
+            [s.download cancel:nil]; [s finishDownloadWithError:@"The download exceeded the 512 MB limit."];
+        } else s.title = [NSString stringWithFormat:@"Downloading: %@", [NSByteCountFormatter stringFromByteCount:bytes countStyle:NSByteCountFormatterCountStyleFile]];
+    }];
+}
+- (void)finishDownloadWithError:(NSString *)message {
+    [self.timer invalidate]; self.timer = nil; self.download = nil;
+    [fm() removeItemAtURL:self.archive error:nil]; self.archive = nil;
+    self.title = @"Find a Switch RomFS mod"; self.modalInPresentation = NO; self.navigationController.modalInPresentation = NO;
+    self.navigationItem.leftBarButtonItem.enabled = YES; self.navigationItem.rightBarButtonItem.enabled = YES;
+    if (message) alert(self, @"Mod was not installed", message);
+}
+- (void)download:(WKDownload *)download didFailWithError:(NSError *)error resumeData:(NSData *)resumeData {
+    if (download == self.download) [self finishDownloadWithError:error.localizedDescription];
+}
+- (void)downloadDidFinish:(WKDownload *)download {
+    if (download != self.download) return;
+    [self.timer invalidate]; self.timer = nil; self.navigationItem.rightBarButtonItem.enabled = NO;
+    NSURL *archive = self.archive; NSString *name = self.downloadName;
+    NSString *stage = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+    __block NSString *installedName = nil;
+    busy(self, @"Installing mod", ^NSString *{
+        NSString *error = totk_extract_mod_archive(archive, stage);
+        NSString *root = error ? nil : totk_mod_romfs(stage, kBotW ? @"01007EF00011E000" : @"0100F2C0115B6000", &error);
+        if (root) {
+            NSString *safe = name.length ? name : @"Downloaded mod";
+            if ([safe hasPrefix:@"."]) safe = [@"Mod " stringByAppendingString:safe];
+            if (safe.length > 80) safe = [safe substringToIndex:80];
+            // A new directory preserves earlier installs, including mods with identical names.
+            installedName = [NSString stringWithFormat:@"%@ %@", safe, NSUUID.UUID.UUIDString];
+            NSString *target = [mods_dir() stringByAppendingPathComponent:installedName]; NSError *e = nil;
+            // Move the complete verified RomFS directory in one operation; failed extraction never touches Mods.
+            if (![fm() moveItemAtPath:root toPath:target error:&e]) { error = e.localizedDescription; installedName = nil; }
+        }
+        [fm() removeItemAtPath:stage error:nil]; return error;
+    }, ^(NSString *error) {
+        [self finishDownloadWithError:error];
+        if (!error && installedName) {
+            set_mod_enabled(installedName, YES); if (self.installed) self.installed();
+            [self dismissViewControllerAnimated:YES completion:nil];
+        }
+    });
+}
+@end
+
 // ---------- the sections ----------
 static TLForm *graphics_form(void) {
     return [[TLForm alloc] initWithTitle:@"Graphics" build:^NSArray<TLSection *> *(TLForm *me) {
@@ -610,7 +730,33 @@ static TLForm *mods_form(void) {
                  ^(NSString *m) { if (m) alert(me, @"Could not import the mod", m); else set_mod_enabled(url.lastPathComponent, YES); [me reload]; });
         }); };
         [act.rows addObject:imp];
-        return @[list, act];
+        {
+            TLSection *browse = section(kBotW ? @"Find Breath of the Wild mods" : @"Find Tears of the Kingdom mods",
+                [NSString stringWithFormat:@"Browse here and tap a ZIP or RAR download to install and enable it automatically. Choose Switch %@ base-game RomFS mods (one romfs folder, up to 512 MB compressed / 2 GB extracted). Nexus may require login and its normal download steps. Other archive formats need manual extraction and folder import.", mod_game_version()]);
+            NSArray *sites = kBotW ? @[
+                @[@"Browse GameBanana (Switch)", @"https://gamebanana.com/games/6386"],
+                @[@"Browse Nexus Mods", @"https://www.nexusmods.com/games/legendofzeldabreathofthewild/mods"]
+            ] : @[
+                @[@"Browse GameBanana (Switch)", @"https://gamebanana.com/games/7617"],
+                @[@"Browse Nexus Mods", @"https://www.nexusmods.com/games/legendofzeldatearsofthekingdom/mods"]
+            ];
+            for (NSArray<NSString *> *site in sites) {
+                TLRow *link = row(site[0], @"Browse and install ZIP / RAR downloads"); link.symbol = @"safari";
+                NSString *address = site[1];
+                link.tapped = ^{
+                    TLModBrowser *browser = [TLModBrowser new]; browser.site = [NSURL URLWithString:address];
+                    browser.installed = ^{ [me reload]; };
+                    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:browser];
+                    nav.modalPresentationStyle = UIModalPresentationFullScreen;
+                    [me presentViewController:nav animated:YES completion:nil];
+                };
+                [browse.rows addObject:link];
+            }
+            TLSection *compatibility = section(@"Supported downloads",
+                kBotW ? @"Use extracted Switch RomFS files. Wii U/Cemu packs, BNP/UKMM packages, cheats and exefs code patches cannot be imported directly. Export packages as Switch RomFS with their mod manager first. DLC RomFS replacements are not supported. Mods that change the same file overwrite each other; this screen does not merge their contents. Back up saves before trying a new mod."
+                      : @"Use Switch RomFS mods matching the game version shown above. Cheats, exefs code patches and emulator graphics mods are not supported. Mods that change the same file overwrite each other; this screen does not merge their contents. Some UI and heap files are reserved by this port and cannot be replaced by player mods. Back up saves before trying a new mod.");
+            return @[list, act, browse, compatibility];
+        }
     }];
     form.navigationItem.leftBarButtonItem = form.editButtonItem;
     return form;

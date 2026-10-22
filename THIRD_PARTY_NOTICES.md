@@ -21,3 +21,4 @@ Fetched or linked at build time (not in this repository):
 | [hactool](https://github.com/SciresM/hactool) at `1d64a83` (with explicit private title-key-file hook), including its bundled mbedTLS | Base + update BKTR merge at build time only | ISC (hactool), Apache-2.0 (mbedTLS); see fetched source LICENSE files |
 | libopus (Homebrew), linked statically | Opus audio | BSD-3-Clause |
 | libvpx (Homebrew), linked statically | VP9 movies | BSD-3-Clause |
+| [libarchive 3.8.9](https://github.com/libarchive/libarchive/releases/tag/v3.8.9), SHA-256 pinned by `ios/tools/build_archive.py`, linked statically on iOS | RAR/RAR5 mod extraction | BSD and compatible per-file licenses; `games/totk/ios/Sources/Libarchive-LICENSE.txt` (also bundled in the app) |

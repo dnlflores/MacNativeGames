@@ -85,9 +85,13 @@ def main():
     # Build device dependencies separately: Homebrew's Mac archives cannot be linked into an iOS application.
     deps=tree/'build/ios-deps'
     run([sys.executable,ios/'tools/build_deps.py',deps],tree,logs/'ios-dependencies.log',env)
+    archive_deps=tree/'build/archive-deps'
+    run([sys.executable,ios/'tools/build_archive.py','--out',archive_deps],tree,logs/'ios-archive.log',env)
+    shutil.copytree(archive_deps/'ios/include',gen/'deps/include',dirs_exist_ok=True)
     shutil.copytree(deps/'include',gen/'deps/include',dirs_exist_ok=True)
     (gen/'deps/lib').mkdir(parents=True,exist_ok=True)
     for lib in ('libopus.a','libvpx.a','libtotk_spvc.a'): clone(deps/'lib'/lib,gen/'deps/lib'/lib)
+    clone(archive_deps/'ios/lib/libarchive.a',gen/'deps/lib/libarchive.a')
     # The in-app shader translator (tools/totk_xlate/publish_ios.sh): checked like the Mac's prebuilt totk_xlate
     xlate=tree/'prebuilt/ios-arm64'
     for line in (xlate/'SHA256SUMS').read_text().splitlines():
@@ -126,8 +130,8 @@ def main():
     # Generate the app project with resolved identity and the embedded-segment linker flags.
     env.update(TOTK_APP_NAME=a.app_name,TOTK_BUNDLE_ID=a.bundle_id)
     xcconfig=gen/'totk.xcconfig'
-    frameworks=' '.join('-framework '+x for x in ['UIKit','Metal','MetalFX','Foundation','QuartzCore','ImageIO','CoreGraphics','CoreText','UniformTypeIdentifiers','CoreFoundation','AudioToolbox','GameController','AVFAudio','Security'])
-    xcconfig.write_text(f'OTHER_LDFLAGS = $(inherited) {frameworks} Gen/deps/lib/libopus.a Gen/deps/lib/libvpx.a Gen/deps/lib/libtotk_xlate.a Gen/deps/lib/libtotk_xlate_boot.o Gen/deps/lib/libtotk_spvc.a -lc++ {flags}\n')
+    frameworks=' '.join('-framework '+x for x in ['UIKit','WebKit','Metal','MetalFX','Foundation','QuartzCore','ImageIO','CoreGraphics','CoreText','UniformTypeIdentifiers','CoreFoundation','AudioToolbox','GameController','AVFAudio','Security'])
+    xcconfig.write_text(f'OTHER_LDFLAGS = $(inherited) {frameworks} Gen/deps/lib/libopus.a Gen/deps/lib/libvpx.a Gen/deps/lib/libtotk_xlate.a Gen/deps/lib/libtotk_xlate_boot.o Gen/deps/lib/libtotk_spvc.a Gen/deps/lib/libarchive.a -lc++ -lz -liconv {flags}\n')
     run(['xcodegen','generate','--spec','project.generated.yml'],ios,logs/'xcodegen.log',env)
     derived=tree/'build/ios-derived';run(['xcodebuild','-project','TOTKIOS.xcodeproj','-scheme','TOTKIOS','-configuration','Release',
         '-destination','generic/platform=iOS','-derivedDataPath',derived,'CODE_SIGNING_ALLOWED=NO','CODE_SIGNING_REQUIRED=NO','CODE_SIGN_IDENTITY='],
