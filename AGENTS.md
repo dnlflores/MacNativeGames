@@ -43,16 +43,15 @@ normally. A debugger may intercept intentional runtime faults and alter behavior
 
 ## Display and menu findings
 
-Normal BotW launches now use the original 16:9 canvas. The launcher deliberately
-ignores the old `matchDisplay` preference from experimental builds. Keep native
-resolution presets, enhancements, mods, and the readback fix intact. Bars on a
-taller display are expected; do not stretch or crop the completed image.
+Keep BotW fullscreen enabled by default (`matchDisplay`, default YES). The owner
+explicitly requires the game to fill the display and has confirmed gameplay is
+working. Fix pause composition without disabling fullscreen, changing gameplay
+projection, reducing quality, or reverting unrelated work. The temporary build 10
+16:9 rollback was rejected and has been reversed. Preserve native resolution,
+enhancements, mods, and the Magnesis correction.
 
-The native-aspect experiment remains available only through an explicit diagnostic
-launch environment. It is **not ready to enable in the launcher**. Builds 6–9
-had mismatched pause-menu capture/blur backgrounds, clipping, preview composition,
-and quick-select HUD duplication. A successful compiler run or synthetic geometry
-test did not establish correct menu composition. See `docs/ios-display.md`.
+Pause-menu capture/blur layers and clipping still require on-device validation.
+See `docs/ios-display.md`. Do not call a global letterbox fallback a menu fix.
 
 Findings useful for further investigation:
 

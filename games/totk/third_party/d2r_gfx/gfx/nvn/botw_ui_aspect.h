@@ -7,6 +7,13 @@ static inline botw_ui_scale botw_ui_fit(double aspect, int screen_fill) {
     if (screen_fill || !isfinite(f) || f <= 0 || fabs(f-1) < .001) return (botw_ui_scale){1,1};
     return f < 1 ? (botw_ui_scale){1,f} : (botw_ui_scale){1/f,1};
 }
+/* Capture panes already contain the screen projection, including any HUD. Pause
+   composition can crop them into several rectangles; fitting a partial pane a
+   second time displaces its edges relative to the other captured rectangles.
+   Only solid fades still require proof of full-view geometry. */
+static inline botw_ui_scale botw_ui_composite(double aspect, int full, int screen, int sampled) {
+    return botw_ui_fit(aspect, screen || (full && !sampled));
+}
 /* Quick-select blur/capture buffers retain the game's original 16:9 dimensions.
    Only GPU-produced images can qualify; artwork/atlases uploaded from disk cannot. */
 static inline int botw_ui_screen_texture(unsigned w,unsigned h,unsigned target_w,unsigned target_h,int rendered) {

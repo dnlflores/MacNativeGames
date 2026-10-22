@@ -1,30 +1,20 @@
 # Breath of the Wild: iPad display shape
 
-Normal launches use the game's original **16:9** canvas. The complete image fits
-inside the display with its proportions preserved; taller iPads have bars above
-and below it. Resolution presets, texture enhancements, mods, and the Magnesis
-readback correction remain available. The old saved `matchDisplay` preference is
-ignored, so upgrading an experimental fullscreen build restores consistent rendering.
+Graphics → **Match display** is enabled by default. The game fills the display;
+the resolution preset supplies the canvas width and taller screens add rows.
+Turning it off explicitly selects original 16:9. Preserve this default while
+fixing menu composition: the owner rejected the temporary build 10 letterbox
+rollback. Native resolution, enhancements and mod preparation remain unchanged.
 
-## Experimental native aspect (disabled in normal launches)
-
-The native-aspect experiment is **not visually correct**. On-device tests of builds
-6–9 showed mismatched pause-menu backgrounds, blur captures, clipping, character
-preview composition, and quick-select HUD duplication. Geometry tests and compiler
-checks did not establish correct final composition. Do not re-enable this in the
-launcher until all these screens have been checked on the device at both 16:9 and
-native aspect, with enhancements enabled. Fixed menu bars are preferable to an
-incorrect picture.
-
-For investigation only, an explicit launch environment with
-`TOTK_IOS_MATCH_DISPLAY=1` enables the experimental canvas. It derives the aspect
-from the game view at startup, preserves the selected canvas width, and adds rows
-on taller displays. This costs GPU time and memory. It does not support live
-render-target reallocation when resizing a window.
+Pause-menu backgrounds can be composed from several partial capture panes, so
+full-screen geometry is not a prerequisite for a screen-copy treatment. These
+layers must retain their screen mapping rather than receive the ordinary UI fit
+a second time. Static artwork and character previews must remain separate.
+On-device verification is still required for the remaining pause composition.
 
 The frontend configures `TOTK_BOTW_RES`, `TOTK_OPERATION_MODE=docked`, and
 `TOTK_ASPECT` before the loader sizes memory. `TOTK_IOS_MATCH_DISPLAY=0` keeps
-the original canvas (the normal launcher default). Explicit `TOTK_ASPECT` takes precedence.
+the original canvas (an explicit user choice). Explicit `TOTK_ASPECT` takes precedence.
 
 Three verified BotW 1.6.0 camera instructions load the aspect override from the
 loader's data page (+56). The Mac export embeds the stubs into the iOS executable;
@@ -37,8 +27,8 @@ rule; it does not depend on the preceding frame's last canvas texture. Fixed 16:
 menu artwork is fitted with its proportions and contents preserved. It may leave
 bars in menus; 3D gameplay still fills the display.
 
-A separate treatment is allowed only for actual full-view quad geometry copying a
-screen capture or drawing a solid fade. The renderer fetches vertices/indices and
+GPU-produced screen captures keep screen mapping for full or partial panes.
+Solid fades use that treatment only for actual full-view quad geometry. The renderer fetches vertices/indices and
 uniforms from their pending-update snapshots and projects them to check coverage.
 Shared quad dimensions alone do not establish an element's bounds. This avoids
 mistaking menu panels, HUD icons or logos for backgrounds and enlarging them.

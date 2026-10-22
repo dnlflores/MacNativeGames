@@ -23,6 +23,16 @@ int main(void){{
   /* Every ordinary pane, logo and glyph fits; none expands past screen edges. */
   assert(layout.x<=1 && layout.y<=1 && layout.x>0 && layout.y>0);
   assert(screen.x==1 && screen.y==1);
+  /* Pause backgrounds may be split or clipped: captured screen coordinates
+     must agree across full and partial panes, including their scissors. */
+  botw_ui_scale partial=botw_ui_composite(a,0,1,1);
+  botw_ui_scale whole=botw_ui_composite(a,1,1,1);
+  assert(partial.x==whole.x && partial.y==whole.y && partial.y==1);
+  /* A sampled panel/artwork or a partial solid stays in the ordinary UI fit. */
+  botw_ui_scale panel=botw_ui_composite(a,0,0,1);
+  botw_ui_scale solid=botw_ui_composite(a,0,0,0);
+  assert(panel.x==layout.x && panel.y==layout.y);
+  assert(solid.x==layout.x && solid.y==layout.y);
  }}
  float m[136]={{0}};m[0]=2.0f/1280;m[5]=2.0f/720;m[10]=m[15]=1;
  m[16]=m[21]=m[26]=1;m[132]=1280;m[133]=720;m[134]=-640;m[135]=360;

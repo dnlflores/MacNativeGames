@@ -6984,8 +6984,9 @@ static int botw_ui_vertices(const p_draw *dw, const p_draw_idx *di, float P[6][4
     }
     return 1;
 }
-/* All layout programs, including text, use one transform. Only actual full-view
-   geometry sampling a screen capture (or a solid fade) may bypass it. */
+/* Ordinary layout programs, including text, use one transform. Screen capture
+   panes keep screen coordinates even when pause composition crops their geometry.
+   Solid fades bypass layout fitting only after proving full-view coverage. */
 static void botw_ui_transform(NvProg *pr, const p_draw *dw, const p_draw_idx *di,
                               NSUInteger tw, NSUInteger th, double *ux, double *uy) {
     double aspect=uw_ratio(); const char *off=getenv("TOTK_UI_SQUEEZE");
@@ -7012,7 +7013,7 @@ static void botw_ui_transform(NvProg *pr, const p_draw *dw, const p_draw_idx *di
         if(valid)full=botw_ui_screen_quad((const float (*)[2])xy,count,prim==5);
     }
     NvShader *fs=pr->sh[1];
-    if(full && fs)for(int i=0;i<fs->rf.nb;i++) {
+    if(fs)for(int i=0;i<fs->rf.nb;i++) {
         const nvn_rbind *b=&fs->rf.b[i];
         if(b->kind!=NVN_RB_TEX || b->reg<0 || b->reg>=128)continue;
         int tid=(int)(S.tex[1][b->reg]&0xfffff);
@@ -7025,8 +7026,8 @@ static void botw_ui_transform(NvProg *pr, const p_draw *dw, const p_draw_idx *di
         if(w>1 || h>1)sampled=1;
         if(serial && botw_ui_screen_texture(w,h,(unsigned)tw,(unsigned)th,gpu_owned(serial)))screen=1;
     }
-    int fill=full && (screen || !sampled);
-    botw_ui_scale scale=botw_ui_fit(aspect,fill);*ux=1/scale.x;*uy=scale.y;
+    int fill=screen || (full && !sampled);
+    botw_ui_scale scale=botw_ui_composite(aspect,full,screen,sampled);*ux=1/scale.x;*uy=scale.y;
     /* Bounded diagnostics: one record per shader and treatment, enabled explicitly. */
     static int trace=-1; static char seen[32][10]; static int nseen;
     if(trace<0)trace=getenv("TOTK_BOTW_UI_TRACE")!=NULL;

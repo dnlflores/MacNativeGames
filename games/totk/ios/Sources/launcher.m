@@ -327,11 +327,7 @@ NSString *totk_launcher_apply(void) {
     if ([g isEqualToString:@"docked-mfx"]) { setenv("TOTK_IOS_DRAWABLE_H", "0", 0); setenv("TOTK_MFX_UPSCALE", "1", 0); setenv("TOTK_MFX_OUTPUT", "1", 0); }
     else if (native) { setenv("TOTK_BOTW_RES", native.UTF8String, 0); setenv("TOTK_IOS_DRAWABLE_H", "0", 0); }
     else if (docked) setenv("TOTK_IOS_DRAWABLE_H", "1080", 0);
-    /* Native-aspect menu captures use several incompatible view rectangles. Until
-       those passes share a coordinate system, keep the complete frame at 16:9.
-       Ignore the old saved matchDisplay=YES from experimental builds. An explicit
-       launch environment can still opt into the diagnostic path. */
-    if (kBotW) setenv("TOTK_IOS_MATCH_DISPLAY", "0", 0);
+    if (kBotW) setenv("TOTK_IOS_MATCH_DISPLAY", flag(@"matchDisplay", YES) ? "1" : "0", 0);
     if (!flag(@"fpsCounter", YES)) setenv("TOTK_FPS_OVERLAY", "0", 0);
     NSString *cap = frame_cap(); if (![cap isEqualToString:@"default"]) setenv("TOTK_UNCAPPED_HZ", cap.UTF8String, 0);
     /* MetalFX frame generation finds its inputs (camera, depth, UI) in Tears of the Kingdom only: in Breath of the Wild it made
@@ -627,7 +623,9 @@ static TLForm *graphics_form(void) {
         }
         TLSection *disp = section(@"Display", nil);
         if (kBotW) {
-            TLRow *shape = row(@"Original proportions", @"16:9 preserves menu, map, and HUD alignment. Black bars on taller displays are expected.");
+            TLRow *shape = row(@"Match display", @"Fill the screen with correct world proportions. Applies when starting the game. Turn off for original 16:9.");
+            shape.isSwitch = YES; shape.on = flag(@"matchDisplay", YES);
+            shape.toggled = ^(BOOL on) { [defs() setBool:on forKey:@"matchDisplay"]; };
             [disp.rows addObject:shape];
         }
         TLRow *fps = row(@"FPS counter", @"Frame rate and resolution in the corner"); fps.isSwitch = YES; fps.on = flag(@"fpsCounter", YES);
