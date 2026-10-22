@@ -8,6 +8,50 @@ ROOT=Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(shutil.which('clang'),'C compiler required')
 class BotwUIAspect(unittest.TestCase):
+    def test_copied_capture_provenance(self):
+        header=ROOT/'games/totk/third_party/d2r_gfx/gfx/nvn/botw_ui_capture.h'
+        aspect=header.with_name('botw_ui_aspect.h')
+        with tempfile.TemporaryDirectory() as directory:
+            p=Path(directory)
+            (p/'copy.c').write_text(f'''#include "{header}"
+#include "{aspect}"
+#include <assert.h>
+int main(void){{
+ totk_serial_set copies={{0}};
+ int whole=botw_ui_whole_copy(1280,720,1280,720,0,0,0,0,1280,720);
+ assert(whole);
+ /* Rendered scene -> capture -> second copy, with neither destination itself
+    rendered into. Both must keep screen mapping, including partial UI panes. */
+ botw_ui_capture_copy(&copies,1,2,1,whole);
+ botw_ui_capture_copy(&copies,2,3,0,whole);
+ for(int serial=2;serial<=3;serial++){{
+  int screen=botw_ui_screen_texture(1280,720,2560,1764,totk_serial_has(&copies,serial));
+  botw_ui_scale scale=botw_ui_composite(2816.0/1940,0,screen,1);
+  assert(screen && scale.x==1 && scale.y==1);
+ }}
+ /* Same-sized static artwork cannot become a capture just by being copied. */
+ botw_ui_capture_copy(&copies,10,11,0,whole);
+ assert(!totk_serial_has(&copies,11));
+ /* A partial or offset copy, and an overwrite from static content, remove
+    previous capture provenance rather than misclassifying subsequent draws. */
+ assert(!botw_ui_whole_copy(1280,720,1280,720,0,0,0,0,640,720));
+ assert(!botw_ui_whole_copy(1280,720,1280,720,1,0,0,0,1280,720));
+ assert(!botw_ui_whole_copy(1280,720,640,360,0,0,0,0,1280,720));
+ botw_ui_capture_copy(&copies,1,2,1,0);
+ botw_ui_capture_copy(&copies,10,3,0,whole);
+ assert(!totk_serial_has(&copies,2) && !totk_serial_has(&copies,3));
+ botw_ui_capture_copy(&copies,1,2,1,whole);
+ botw_ui_capture_copy(&copies,2,2,0,whole);
+ assert(totk_serial_has(&copies,2));
+ totk_serial_del(&copies,2); /* finalized serial / CPU upload */
+ assert(!totk_serial_has(&copies,2));
+ totk_serial_destroy(&copies);
+ return 0;
+}}''')
+            binary=p/'copy'
+            subprocess.run(['clang','-std=c11','-Wall','-Wextra','-Werror',str(p/'copy.c'),'-lm','-o',str(binary)],check=True,capture_output=True)
+            subprocess.run([str(binary)],check=True)
+
     def test_layout_and_capture_proportions(self):
         header=ROOT/'games/totk/third_party/d2r_gfx/gfx/nvn/botw_ui_aspect.h'
         with tempfile.TemporaryDirectory() as directory:

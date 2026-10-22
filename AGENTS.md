@@ -51,6 +51,11 @@ projection, reducing quality, or reverting unrelated work. The temporary build 1
 enhancements, mods, and the Magnesis correction.
 
 Pause-menu capture/blur layers and clipping still require on-device validation.
+A candidate now tracks whole 2D copies of rendered captures separately from GPU
+writeback ownership (`botw_ui_capture.h`). `gpu_owned` alone cannot classify
+copied screen content. Keep the provenance tracking isolated from resource
+synchronization, remove stale tags on overwrite/retirement, and do not label this
+visually verified until the candidate is checked on-device.
 See `docs/ios-display.md`. Do not call a global letterbox fallback a menu fix.
 
 Findings useful for further investigation:

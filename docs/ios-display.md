@@ -50,3 +50,18 @@ ratios, checking the result, preservation of non-16:9 camera ratios, scratch reg
 condition flags and stack. `tests/test_botw_ui_aspect.py` checks layout and artwork
 proportions and ensures screen captures are not fitted twice.
 No game data is required by the test.
+
+## Copied pause captures
+
+The UI screen-content classification now follows whole base-level 2D texture
+copies from render targets, including chains of copies. Previously only textures
+rendered into directly qualified: a copied capture could be fitted as artwork
+and displaced relative to other menu layers. This provenance is separate from
+GPU ownership; it never changes uploads, writeback, texture pixels, camera
+projection or resolution. Partial copies and overwrites cannot inherit an old
+whole-screen tag. Static artwork copies do not acquire it. Tags are removed on
+texture retirement, explicit CPU writes, buffer uploads and clears.
+
+This is a candidate correction for pause-menu composition. Synthetic tests cover
+copy chains, static content, partial/offset copies and overwritten/reused records;
+only an on-device visual check can confirm that it resolves the reported menu.

@@ -2163,6 +2163,21 @@ static totk_serial_set g_dead_serial;   // serial -> (void *)1 once finalized
 /* TOTK: serials the GPU has rendered into. A mirrored (CPU-pool) texture that the game then uses as a render target is owned by
    the GPU from that point: dirty-page re-uploads from the (stale) pool memory would wipe the rendered content. */
 static totk_serial_set g_gpu_owned;
+#if GAME_BOTW
+#include "botw_ui_capture.h"
+static totk_serial_set g_botw_ui_copies; /* classification, not GPU writeback ownership */
+static void botw_ui_copy_forget(uint64_t serial) {
+    pthread_mutex_lock(&g_smu);
+    totk_serial_del(&g_botw_ui_copies,serial);
+    pthread_mutex_unlock(&g_smu);
+}
+static int botw_ui_screen_content(uint64_t serial) {
+    pthread_mutex_lock(&g_smu);
+    int screen=totk_serial_has(&g_gpu_owned,serial) || totk_serial_has(&g_botw_ui_copies,serial);
+    pthread_mutex_unlock(&g_smu);
+    return screen;
+}
+#endif
 static _Atomic uint64_t g_owned_gen = 1;   // TOTK: bumped whenever a serial joins g_gpu_owned (entries are never removed)
 static void pkg_owned_locked(uint64_t k);
 static void gpu_owned_mark(uint64_t k) { pthread_mutex_lock(&g_smu); int had = totk_serial_has(&g_gpu_owned, k); if (!had) { totk_serial_add(&g_gpu_owned, k); atomic_fetch_add(&g_owned_gen, 1); pkg_owned_locked(k); } pthread_mutex_unlock(&g_smu);
@@ -2190,6 +2205,9 @@ static void serial_forget_locked_rmu(uint64_t k) {   /* g_rmu held (g_rmu -> g_p
     pthread_mutex_lock(&g_smu);
     if (totk_serial_del(&g_dead_serial, k)) g_serial_forgotten++;
     totk_serial_del(&g_gpu_owned, k);
+#if GAME_BOTW
+    totk_serial_del(&g_botw_ui_copies, k);
+#endif
     pthread_mutex_unlock(&g_smu);
 }
 static inline int registry_lock(void); static inline void registry_unlock(void);
@@ -7024,7 +7042,7 @@ static void botw_ui_transform(NvProg *pr, const p_draw *dw, const p_draw_idx *di
         }
         registry_unlock();
         if(w>1 || h>1)sampled=1;
-        if(serial && botw_ui_screen_texture(w,h,(unsigned)tw,(unsigned)th,gpu_owned(serial)))screen=1;
+        if(serial && botw_ui_screen_texture(w,h,(unsigned)tw,(unsigned)th,botw_ui_screen_content(serial)))screen=1;
     }
     int fill=screen || (full && !sampled);
     botw_ui_scale scale=botw_ui_composite(aspect,full,screen,sampled);*ux=1/scale.x;*uy=scale.y;
@@ -10540,6 +10558,9 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
 // TOTK: CPU texture write (WriteTexels), mirroring mtl_read_texels: packaged textures update pool memory in
 // block-linear layout (dirty tracking re-uploads it); other textures are written into the MTLTexture by blit.
 void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
+#if GAME_BOTW
+    botw_ui_copy_forget(t->serial);
+#endif
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!bpb) die("WriteTexels: unknown format %d", t->d.format);
     size_t wb = (size_t)((r->width + bw - 1) / bw) * bpb, hb = (r->height + bh - 1) / bh, x0 = (size_t)(r->xoffset / bw) * bpb, y0 = r->yoffset / bh;
@@ -10596,6 +10617,9 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
     if (!nogpu() && cb.status != MTLCommandBufferStatusCompleted) die("WriteTexels: GPU upload failed");
 }
 static void copy_b2t(const p_copy_b2t *c) {
+#if GAME_BOTW
+    if(c->tex)botw_ui_copy_forget(c->tex->serial);
+#endif
     if (c->tex) zskip_del(c->tex->serial);
     id<MTLTexture> t = tex_mtl(c->tex);
     PD("C ser=%llu", c->tex->serial);
@@ -10711,6 +10735,19 @@ static void copy_t2t(const p_copy_t2t *c) {
     else
         for (int z = 0; z < nz; z++)
             enc_b_copy_texture(b, s, sz0 + c->sr.zoffset + z, sl, MTLOriginMake(c->sr.xoffset, c->sr.yoffset, 0), MTLSizeMake(c->sr.width, c->sr.height, 1), d, dz0 + c->dr.zoffset + z, dl, MTLOriginMake(c->dr.xoffset, c->dr.yoffset, 0));
+#if GAME_BOTW
+    /* A pause capture copied by the GPU is still screen content. Keep this
+       separate from g_gpu_owned: classification must not alter uploads/readback.
+       Only a whole base-level 2D copy can inherit the screen-coordinate mapping. */
+    int whole=!s3 && !d3 && nz==1 && !sl && !dl && !sz0 && !dz0 &&
+        !c->sr.zoffset && !c->dr.zoffset &&
+        botw_ui_whole_copy(c->src->d.width,c->src->d.height,c->dst->d.width,c->dst->d.height,
+                          c->sr.xoffset,c->sr.yoffset,c->dr.xoffset,c->dr.yoffset,c->sr.width,c->sr.height);
+    pthread_mutex_lock(&g_smu);
+    botw_ui_capture_copy(&g_botw_ui_copies,c->src->serial,c->dst->serial,
+                         totk_serial_has(&g_gpu_owned,c->src->serial),whole);
+    pthread_mutex_unlock(&g_smu);
+#endif
 }
 
 // GPU：用给定值清贴图区域（原先误列为空操作，初始化调 5 次；Metal 私有贴图初值未定义，游戏依赖清出的初值）。
@@ -10720,6 +10757,9 @@ static void copy_t2t(const p_copy_t2t *c) {
 // Whole level and whole face, all four channels written -> open one clear-only render pass per layer / depth slice (the hardware converts the clear value by the texture format, including integer and depth);
 // view with changed format: clear on a view of that format; partial region, partial channels, compressed / packaged textures (no render target usage): report a failure, to be implemented
 static void clear_tex(const p_clear_tex *c) {
+#if GAME_BOTW
+    if(c->tex)botw_ui_copy_forget(c->tex->serial);
+#endif
     if (c->tex) zskip_del(c->tex->serial);
     if (atomic_load(&g_draw_log) > 0 && c->tex)
         MLOG("[uw] F%llu pass %llu clear tex ser %llu %ux%u fmt %#x region %d,%d %dx%d mask %#x %g %g %g %g", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, (unsigned long long)c->tex->serial,
