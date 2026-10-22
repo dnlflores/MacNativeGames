@@ -7116,6 +7116,47 @@ static uint64_t ui_mat_patch(const p_bind_buf *u, void *mb, uint64_t mo) {
     la = u->addr; ls = u->size; lp = g_pass.serial; lo = g_ui_moff; lg = ring_gpu + at; at += n;
     return lg;
 }
+#if GAME_BOTW
+/* Inventory Link (and other UI previews) with the display-shaped canvas (TOTK_ASPECT): the off-centre preview camera
+   gets the display aspect and keeps its vertical field of view, so the model comes out canvas-aspect / (16:9) times
+   larger than the 16:9 menu fitted around it. Every binding of such a camera block (geometry, lighting, any stage) gets
+   a copy with the field of view widened back: x scale by sx(16:9) / sx about the projection centre, y scale by the
+   16:9 band's share of the height, as the 16:9 render placed it. Patched: view-projection rows x and y, projection,
+   tan of the half fields of view (the lighting passes rebuild positions from them), aspect and field of view, and the
+   previous frame's copy. The world camera is centred and keeps the fill. Block (2336 bytes): view 0..11,
+   view-projection 12..27, projection 28..43, aspect 62, tan half fov x / y 68 / 69, fov 70, size 72 / 73, previous
+   frame's view, view-projection and projection 84..127. */
+static void botw_cam_unzoom(float *c, int b, double fx, double fy) {
+    double p00=c[b+28];
+    for(int k=0;k<4;k++) { c[b+12+k]-=(float)((1-fx)*p00*c[b+k]); c[b+16+k]*=(float)fy; }
+    c[b+28]*=(float)fx;c[b+33]*=(float)fy;c[b+34]*=(float)fy;
+}
+static int botw_cam_offcentre(const float *c, int b, double *fx) {
+    if(!(c[b+42]<0 && c[b+28]>0 && c[b+33]>0) || fabs(c[b+30]/c[b+42])<.05)return 0;
+    *fx=c[b+33]*9/(16*c[b+28]);
+    return *fx>.3 && *fx<.999;
+}
+static const uint8_t *bound_uniform_bytes(uint64_t gpu, size_t size, id<MTLBuffer> original);
+static uint64_t botw_preview_cam(const p_bind_buf *u, uint64_t gpu, id<MTLBuffer> mb) {
+    enum { RING = 1 << 20, SZ = (MFX_CAM_SIZE + 255) & ~255 };
+    static __strong id<MTLBuffer> ring; static uint64_t ring_gpu, la, lp, lsrc, lg; static size_t at;
+    if(u->size!=MFX_CAM_SIZE || !uw_ratio())return 0;
+    if(la==u->addr && lp==g_pass.serial && lsrc==gpu)return lg;
+    if(!ring) { ring=[g_dev newBufferWithLength:RING options:MTLResourceStorageModeShared]; res_add(ring); ring_gpu=ring.gpuAddress; }
+    if(at+SZ>RING)at=0;
+    float *c=(float *)((uint8_t *)ring.contents+at);
+    const uint8_t *src=bound_uniform_bytes(gpu,MFX_CAM_SIZE,mb);
+    if(src)memcpy(c,src,MFX_CAM_SIZE); else pend_materialize(u->addr,(uint8_t *)c,MFX_CAM_SIZE,0);
+    la=u->addr;lp=g_pass.serial;lsrc=gpu;lg=0;
+    double fx,fy=c[73]>0?c[72]/c[73]*9/16:0,fpx;
+    if(!botw_cam_offcentre(c,0,&fx) || !(fy>.3 && fy<.999))return 0;
+    botw_cam_unzoom(c,0,fx,fy);
+    if(botw_cam_offcentre(c,84,&fpx))botw_cam_unzoom(c,84,fpx,fy);
+    c[68]/=(float)fx;c[69]/=(float)fy;c[70]=2*atanf(c[69]);c[62]=c[68]/c[69];c[63]=1/c[62];
+    lg=ring_gpu+at;at+=SZ;
+    return lg;
+}
+#endif
 /* TOTK_NAN_TRACE: g_nt_watch is the texture the traced shader read in its watched slot (see nt_watch_after_pass). */
 static uint32_t g_dispatch_grid[3];   // TOTK: thread-group counts of the dispatch being encoded (driver segment c0 + 0x200)
 /* Driver banks contain binding metadata, not the pointed-to bytes. Reuse their immutable arena
@@ -7296,6 +7337,9 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             if (ren) { gpu = ren; if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) RED_ONCE(58, "UI 矩阵修补读的是内存，跳过了含内联更新的 uniform 副本"); }
             else if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) { uint64_t pg = ui_mat_patch(u, mb, mo); if (pg) gpu = pg; }
             else { const usnap_t *sc = usnap_find(u->addr, u->size ? u->size : 1); if (sc) gpu = sc->gpu + (u->addr - sc->lo); }   // TOTK: contents as of the submit call
+#if GAME_BOTW
+            if (u->size == MFX_CAM_SIZE) { uint64_t pg = botw_preview_cam(u, gpu, (__bridge id<MTLBuffer>)mb); if (pg) gpu = pg; }   // inventory preview camera
+#endif
             if (bl) {
                 PD("B %llu st%d cb reg%d addr=%#llx size=%llu pool=%#llx+%#llx f=%g,%g,%g,%g", g_stat_pass, nvn_stage, reg, (unsigned long long)u->addr, (unsigned long long)u->size,
                    (unsigned long long)(u->addr - mo), (unsigned long long)mo, ((float *)u->addr)[0], ((float *)u->addr)[1], ((float *)u->addr)[2], ((float *)u->addr)[3]);
