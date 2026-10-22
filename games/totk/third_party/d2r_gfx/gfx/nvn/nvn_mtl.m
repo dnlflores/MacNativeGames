@@ -2166,10 +2166,29 @@ static totk_serial_set g_gpu_owned;
 #if GAME_BOTW
 #include "botw_ui_capture.h"
 static totk_serial_set g_botw_ui_copies; /* classification, not GPU writeback ownership */
-static void botw_ui_copy_forget(uint64_t serial) {
+/* Storage whose last writer copied or filtered the screen (keyed by texture memory). The pause menu copies
+   screen strips and the whole screen with a draw (17dccd27), blurs them, and samples the result through
+   other texture objects at the same storage, so serials alone lose the provenance. */
+static totk_serial_set g_botw_ui_screen_mem;
+static void botw_ui_copy_forget(const tex_t *t) {
     pthread_mutex_lock(&g_smu);
-    totk_serial_del(&g_botw_ui_copies,serial);
+    totk_serial_del(&g_botw_ui_copies,t->serial);
+    if(t->mem)totk_serial_del(&g_botw_ui_screen_mem,(uint64_t)(uintptr_t)t->mem);
     pthread_mutex_unlock(&g_smu);
+}
+static void botw_ui_screen_mem_note(const tex_t *t, int screen) {
+    if(!t->mem)return;
+    pthread_mutex_lock(&g_smu);
+    if(screen)totk_serial_add(&g_botw_ui_screen_mem,(uint64_t)(uintptr_t)t->mem);
+    else totk_serial_del(&g_botw_ui_screen_mem,(uint64_t)(uintptr_t)t->mem);
+    pthread_mutex_unlock(&g_smu);
+}
+static int botw_ui_screen_mem(const tex_t *t) {
+    if(!t->mem)return 0;
+    pthread_mutex_lock(&g_smu);
+    int screen=totk_serial_has(&g_botw_ui_screen_mem,(uint64_t)(uintptr_t)t->mem);
+    pthread_mutex_unlock(&g_smu);
+    return screen;
 }
 static int botw_ui_screen_content(uint64_t serial) {
     pthread_mutex_lock(&g_smu);
@@ -7030,30 +7049,60 @@ static void botw_ui_transform(NvProg *pr, const p_draw *dw, const p_draw_idx *di
         }
         if(valid)full=botw_ui_screen_quad((const float (*)[2])xy,count,prim==5);
     }
+    static int trace=-1; static char seen[64][40]; static int nseen;
+    if(trace<0)trace=getenv("TOTK_BOTW_UI_TRACE")!=NULL;
+    int diag=trace && nseen<64;
     NvShader *fs=pr->sh[1];
+    char seen_tex[96]="";size_t nst=0;
     if(fs)for(int i=0;i<fs->rf.nb;i++) {
         const nvn_rbind *b=&fs->rf.b[i];
         if(b->kind!=NVN_RB_TEX || b->reg<0 || b->reg>=128)continue;
         int tid=(int)(S.tex[1][b->reg]&0xfffff);
-        uint64_t serial=0;unsigned w=0,h=0;
+        uint64_t serial=0;unsigned w=0,h=0;int copied=0;
         registry_lock();
         if(tid>0 && tid<g_ntreg && g_treg[tid].ok) {
-            const tex_t *t=&g_treg[tid].t;serial=t->serial;w=t->d.width;h=t->d.height;
+            const tex_t *t=&g_treg[tid].t;serial=t->serial;w=t->d.width;h=t->d.height;copied=botw_ui_screen_mem(t);
         }
         registry_unlock();
         if(w>1 || h>1)sampled=1;
-        if(serial && botw_ui_screen_texture(w,h,(unsigned)tw,(unsigned)th,botw_ui_screen_content(serial)))screen=1;
+        if(serial && (diag || atomic_load(&g_draw_log)>0) && nst<sizeof seen_tex-24)
+            nst+=snprintf(seen_tex+nst,sizeof seen_tex-nst," %ux%u%s",w,h,copied?"s":botw_ui_screen_content(serial)?"r":"");
+        /* Copied or filtered screen pixels keep the screen mapping whatever their shape (strips, full captures). */
+        if(copied || (serial && botw_ui_screen_texture(w,h,(unsigned)tw,(unsigned)th,botw_ui_screen_content(serial))))screen=1;
     }
     int fill=screen || (full && !sampled);
     botw_ui_scale scale=botw_ui_composite(aspect,full,screen,sampled);*ux=1/scale.x;*uy=scale.y;
-    /* Bounded diagnostics: one record per shader and treatment, enabled explicitly. */
-    static int trace=-1; static char seen[32][10]; static int nseen;
-    if(trace<0)trace=getenv("TOTK_BOTW_UI_TRACE")!=NULL;
-    if(trace && nseen<32) {
-        char tag[10];snprintf(tag,sizeof tag,"%.8s%d",key,fill);int known=0;
+    /* Bounded diagnostics: one record per shader, treatment and inputs, enabled explicitly. */
+    if(diag) {
+        char tag[40];snprintf(tag,sizeof tag,"%.8s%d%s",key,fill,seen_tex);int known=0;
         for(int i=0;i<nseen;i++)known|=!strcmp(tag,seen[i]);
-        if(!known){strcpy(seen[nseen++],tag);MLOG("[botw-ui] %.8s target %lux%lu treatment %s scale %.5f,%.5f full-geometry %d screen-input %d",key,(unsigned long)tw,(unsigned long)th,fill?"screen fill":"layout fit",scale.x,scale.y,full,screen);}
+        if(!known){strcpy(seen[nseen++],tag);MLOG("[botw-ui] %.8s target %lux%lu treatment %s scale %.5f,%.5f full-geometry %d screen-input %d textures%s",key,(unsigned long)tw,(unsigned long)th,fill?"screen fill":"layout fit",scale.x,scale.y,full,screen,seen_tex);}
     }
+    if(atomic_load(&g_draw_log)>0)
+        MLOG("[botw-ui-draw] %.8s %s full-geometry %d screen-input %d textures%s",key,fill?"fill":"fit",full,screen,seen_tex);
+}
+/* Screen provenance of every draw's colour target: a draw that samples the canvas or screen content (the
+   pause menu's copies, blurs and downsamples) leaves screen content; any other draw replaces it. The canvas
+   itself is not tagged. Only with the display-shaped canvas (TOTK_ASPECT); flag draw_log logs each draw. */
+static void botw_ui_note_render(NvProg *pr) {
+    const tex_t *rt=R.rt.n>0?R.rt.color[0]:NULL;
+    int log=atomic_load(&g_draw_log)>0;
+    if(!uw_ratio() || !pr || !pr->sh[1] || !rt || !rt->mem || (rt->serial==g_mfx.canvas && !log))return;
+    char s[400]="";size_t n=0;int screen=0;NvShader *fs=pr->sh[1];
+    for(int i=0;i<fs->rf.nb;i++) {
+        const nvn_rbind *b=&fs->rf.b[i];
+        if(b->kind!=NVN_RB_TEX || b->reg<0 || b->reg>=128)continue;
+        int tid=(int)(S.tex[1][b->reg]&0xfffff);
+        registry_lock();
+        if(tid>0 && tid<g_ntreg && g_treg[tid].ok) {
+            const tex_t *t=&g_treg[tid].t;int in=t->serial==g_mfx.canvas || botw_ui_screen_mem(t);screen|=in;
+            if(log && n<sizeof s-80)n+=snprintf(s+n,sizeof s-n," [%llu %ux%u%s]",(unsigned long long)t->serial,t->d.width,t->d.height,in?" screen":"");
+        }
+        registry_unlock();
+    }
+    if(rt->serial!=g_mfx.canvas)botw_ui_screen_mem_note(rt,screen);
+    if(log)MLOG("[botw-in] %.8s/%.8s -> %llu %ux%u%s%s in%s",pr->sh[0]?pr->sh[0]->key:"-",pr->sh[1]->key,(unsigned long long)rt->serial,
+                rt->d.width,rt->d.height,rt->serial==g_mfx.canvas?" canvas":"",screen?" screen":"",s);
 }
 #endif
 static uint64_t ui_mat_patch(const p_bind_buf *u, void *mb, uint64_t mo) {
@@ -10121,6 +10170,7 @@ frz_plain:;
     double uy = 1, cy = th / 2.0;
 #if GAME_BOTW
     botw_ui_transform(pr, dw, di, tw, th, &ux, &uy);
+    botw_ui_note_render(pr);
 #endif
     if (ux != 1) { vx = cx + (vx - cx) / ux; vw /= ux; }
     double vy = cy + ((S.has_vp ? S.vp[0][1] : 0) + vo - cy) * uy;
@@ -10559,7 +10609,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
 // block-linear layout (dirty tracking re-uploads it); other textures are written into the MTLTexture by blit.
 void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
 #if GAME_BOTW
-    botw_ui_copy_forget(t->serial);
+    botw_ui_copy_forget(t);
 #endif
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!bpb) die("WriteTexels: unknown format %d", t->d.format);
@@ -10618,7 +10668,7 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
 }
 static void copy_b2t(const p_copy_b2t *c) {
 #if GAME_BOTW
-    if(c->tex)botw_ui_copy_forget(c->tex->serial);
+    if(c->tex)botw_ui_copy_forget(c->tex);
 #endif
     if (c->tex) zskip_del(c->tex->serial);
     id<MTLTexture> t = tex_mtl(c->tex);
@@ -10747,6 +10797,7 @@ static void copy_t2t(const p_copy_t2t *c) {
     botw_ui_capture_copy(&g_botw_ui_copies,c->src->serial,c->dst->serial,
                          totk_serial_has(&g_gpu_owned,c->src->serial),whole);
     pthread_mutex_unlock(&g_smu);
+    botw_ui_screen_mem_note(c->dst,c->src->serial==g_mfx.canvas || botw_ui_screen_mem(c->src));
 #endif
 }
 
@@ -10758,7 +10809,7 @@ static void copy_t2t(const p_copy_t2t *c) {
 // view with changed format: clear on a view of that format; partial region, partial channels, compressed / packaged textures (no render target usage): report a failure, to be implemented
 static void clear_tex(const p_clear_tex *c) {
 #if GAME_BOTW
-    if(c->tex)botw_ui_copy_forget(c->tex->serial);
+    if(c->tex)botw_ui_copy_forget(c->tex);
 #endif
     if (c->tex) zskip_del(c->tex->serial);
     if (atomic_load(&g_draw_log) > 0 && c->tex)
