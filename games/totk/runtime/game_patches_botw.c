@@ -1,6 +1,5 @@
 /* Breath of the Wild game-code patches (botw.md): exclusive loads with acquire, the real-time frame step, and the
-   TOTK_JQ_CHECK diagnostics. The functions the shared runtime calls for the output size and keys 3 / 4 answer
-   "not available" until BotW's own sites are found. */
+   TOTK_JQ_CHECK diagnostics, output resolution, and camera aspect ratio. */
 #include <TargetConditionals.h>
 #include <math.h>
 #include <stdatomic.h>
@@ -481,6 +480,55 @@ static void patch_display(Module *m) {
     else fprintf(stderr, "[botw] docked display and render size %ux%u (TOTK_BOTW_RES): render-target budget %u MB (shipped 115), heaps and pool +%llu MB\n",
                  w, h, vals[2] >> 20, (unsigned long long)(extra >> 20));
 }
+/* BotW 1.6.0 camera aspect producers. A data-page override keeps the iOS text immutable;
+   zero retains the original calculation. Each stub preserves its scratch registers,
+   condition flags and stack. */
+static _Atomic(uint32_t) *botw_aspect_slot;
+static void patch_aspect(Module *m) {
+    static const uint32_t sites[][2] = {
+        {0xe0ad68, 0x1e211800}, {0x1271870, 0xbd40b000}, {0x15c2148, 0x1e211800}
+    };
+    uint64_t data = (m->file_size + 0x3fff) & ~0x3fffULL;
+    uint64_t stub = (m->text_end + 15) & ~15ULL;
+    if (stub + sizeof sites / sizeof *sites * 64 > ((m->text_end + 0x3fff) & ~0x3fffULL) ||
+        (m->ro_off && stub + sizeof sites / sizeof *sites * 64 > m->ro_off) || data + 60 > m->size) runtime_fail("BotW aspect patch area out of bounds");
+    for (unsigned i = 0; i < sizeof sites / sizeof *sites; i++) {
+        uint64_t off = stub + i * 64;
+        if (!CODE_PATCHED_AT_BUILD) {
+            uint32_t have; memcpy(&have, m->base + sites[i][0], 4);
+            if (have != sites[i][1]) runtime_fail("BotW aspect camera instruction mismatch");
+            for (unsigned j = 0; j < 64; j++)
+                if (m->base[off+j]) runtime_fail("BotW aspect padding already in use");
+        }
+        /* Only replace the shipped 16:9 ratio. Inventory preview and other cameras
+           have their own aspect; overriding them distorts those scenes. Integer
+           comparison of the upper float bits accepts the game's rounded constant,
+           without changing NZCV or any FP scratch register. */
+        uint32_t words[] = {
+            sites[i][1], 0xa9be2fea, 0xf9000bec,
+            0x1e26000b | ((sites[i][1] & 31) << 5), /* fmov w11, s<result> */
+            0x53087d6b, 0x529c71cc, 0x72a007ec, 0x4a0c016b,
+            0x350000ab, /* cbnz w11, restore */
+            adrp_reg(10, (uintptr_t)m->base + off + 36, (uintptr_t)m->base + data),
+            ldr_w(10, 10, 56), 0x3400004a, 0x1e270140 | (sites[i][1] & 31),
+            0xf9400bec, 0xa8c22fea, b_to(off + 60, sites[i][0] + 4)
+        };
+        for (unsigned j = 0; j < 16; j++) put_word(m, off + j*4, words[j], "camera aspect stub");
+        put_word(m, sites[i][0], b_to(sites[i][0], off), "camera aspect");
+    }
+    float ratio = 0; const char *e = getenv("TOTK_ASPECT");
+    if (e && *e) {
+        double a, w, h; char tail;
+        if ((sscanf(e, "%lf:%lf%c", &w, &h, &tail) == 2 ||
+             sscanf(e, "%lfx%lf%c", &w, &h, &tail) == 2) && w > 0 && h > 0) a = w/h;
+        else if (sscanf(e, "%lf%c", &a, &tail) != 1) runtime_fail("invalid TOTK_ASPECT");
+        if (a != 0 && !(a >= 0.5 && a <= 8)) runtime_fail("TOTK_ASPECT out of range");
+        ratio = (float)a;
+    }
+    botw_aspect_slot = (_Atomic(uint32_t) *)(void *)(m->base + data + 56);
+    uint32_t bits; memcpy(&bits, &ratio, 4); atomic_store(botw_aspect_slot, bits);
+    fprintf(stderr, "[botw] camera aspect %.5f (0 = original 16:9), three verified sites\n", ratio);
+}
 /* Diagnostic (Mac): TOTK_HEAP_LOG=1 logs every heap the game creates through its two create functions (ksys main+0x1a52160,
    sead main+0x125cd50): name, requested size (0: the rest of the parent), parent, and the heap made with its size (field 8). */
 static uint8_t *g_heaplog_main;   /* TOTK_HEAP_LOG (botw_heaplog_hook) */
@@ -488,6 +536,7 @@ static const struct { uint32_t entry, ret, word; } g_heaplog_fn[2] = {{0x1a52160
 void runtime_game_patches(Module *m) {
     fprintf(stderr, "[botw] %s game-code patches\n", TOTK_GAME_VERSION);
     patch_display(m);
+    patch_aspect(m);
     if (code_switch("TOTK_HEAP_LOG")) { uint32_t b = 0xd4200000u | (0x7c1u << 5), was;
       for (int f = 0; f < 2; f++) { memcpy(&was, m->base + g_heaplog_fn[f].entry, 4);
         if (was != g_heaplog_fn[f].word) runtime_fail("heaplog: unexpected create function entry");
@@ -684,5 +733,8 @@ int runtime_output_mode_cycle(void) {
     fprintf(stderr, "[botw] key 3: %s\n", next ? "MetalFX 2K" : "关闭 2K");
     return 1;
 }
-float runtime_aspect_now(void) { return 0; }
+float runtime_aspect_now(void) {
+    if (!botw_aspect_slot) return 0;
+    uint32_t bits = atomic_load(botw_aspect_slot); float ratio; memcpy(&ratio, &bits, 4); return ratio;
+}
 int runtime_aspect_toggle(void) { return 0; }

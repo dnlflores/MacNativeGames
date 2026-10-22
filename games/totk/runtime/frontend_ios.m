@@ -101,6 +101,25 @@ void runtime_ios_attach_layer(CAMetalLayer *layer,UIView *host){
  /* the 16:9 picture should get about want rows: a screen narrower than 16:9 (an iPad, about 4:3; 2026-10-17) holds it by
     width, so there the drawable is want*16/9 columns wide (1281x890 on a 2360x1640 iPad); an iPhone keeps want rows */
  if(want>0){double h=vw/vh<16.0/9.0?round(want*16.0/9.0*vh/vw):(double)want;if(h<vh){vw=round(vw*h/vh);vh=h;}}
+#if GAME_BOTW
+ /* The launcher records intent; only the actual game view knows the window's aspect.
+    Configure before the loader sizes heaps or starts guest threads. Keep the selected
+    quality's width, add rows on a taller display, and use the docked custom canvas. */
+ const char *match=getenv("TOTK_IOS_MATCH_DISPLAY");
+ if(match && atoi(match) && host.bounds.size.width>0 && host.bounds.size.height>0){
+  double aspect=host.bounds.size.width/host.bounds.size.height;
+  unsigned width=1280,height; const char *res=getenv("TOTK_BOTW_RES");
+  if(res) { unsigned h0; if(sscanf(res,"%ux%u",&width,&h0)!=2) width=1280; }
+  else {const char *op=getenv("TOTK_OPERATION_MODE");if(op && !strcmp(op,"docked"))width=1920;}
+  height=(unsigned)lround(width/aspect);height=(height+1)&~1u;
+  if(height<720){height=720;width=((unsigned)lround(height*aspect)+1)&~1u;}
+  char canvas[48],ratio[48];snprintf(canvas,sizeof canvas,"%ux%u",width,height);snprintf(ratio,sizeof ratio,"%.9f",aspect);
+  setenv("TOTK_BOTW_RES",canvas,1);setenv("TOTK_OPERATION_MODE","docked",1);setenv("TOTK_ASPECT",ratio,0);
+  /* Let Metal scale a canvas of the same shape to the physical display. */
+  vw=width;vh=height;
+  fprintf(stderr,"[botw] match display %.5f: canvas %s, camera %s\n",aspect,canvas,ratio);
+ }
+#endif
  metalLayer.drawableSize=CGSizeMake(vw,vh);
  fprintf(stderr,"[totk] view drawable %.0fx%.0f (screen scale %.1f, TOTK_IOS_DRAWABLE_H=%ld)\n",vw,vh,s,want);
  bootOverlay=[[UIView alloc] initWithFrame:host.bounds];bootOverlay.autoresizingMask=UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;

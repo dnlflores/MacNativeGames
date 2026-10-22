@@ -2289,9 +2289,10 @@ static void pkg_owned_locked(uint64_t k) { id o = hm_get_id(&g_by_serial, &k); i
    GPU into such a pool and copies them with the CPU into new tiles: after moving, new tiles got stale normals and the
    ground turned black block by block (2026-10-15). Each rendering of a mirrored texture is noted here (with a reference,
    so the result outlives a temporary texture object finalized before the submission runs); an invalidate over its
-   memory waits for the GPU and writes every level back in the NVN layout, unless the CPU has written the memory since
-   the rendering (then the CPU's bytes are newer). Runtime switch: TOTK_INPUT_FILE "flag writeback 0|1" (default 1). */
-typedef struct { tex_t t; uint64_t stamp; void *obj; } wb_ent;
+   memory waits for the GPU and writes every level back in the NVN layout. Full invalidations of linear readback
+   textures discard the CPU copy; other cases retain the CPU-write freshness check.
+   Runtime switch: TOTK_INPUT_FILE "flag writeback 0|1" (default 1). */
+typedef struct { tex_t t; uint64_t stamp; void *obj; int invalidate_covers; } wb_ent;
 static nvn_hmap g_wb = {.klen = 8};   // serial -> wb_ent * (g_smu): rendered since the last write-back
 static _Atomic int g_wb_on = 1;
 /* TOTK: fill the driver segment c0 for vertex and compute shaders (thread-group counts, uniform / storage address tables,
@@ -2406,7 +2407,7 @@ static void wb_note(const tex_t *t) {
     nvn_dirty_protect(t->mem, t->L.size);
     pthread_mutex_lock(&g_smu);
     wb_ent *e = nvn_hm_get(&g_wb, &k);
-    if (e) { e->stamp = stamp; e->t = *t; pthread_mutex_unlock(&g_smu); return; }
+    if (e) { e->stamp = stamp; e->t = *t; e->invalidate_covers = 0; pthread_mutex_unlock(&g_smu); return; }
     e = calloc(1, sizeof *e); if (!e) MDIE("write-back record");
     e->t = *t; e->stamp = stamp; e->obj = (void *)CFBridgingRetain(o);
     nvn_hm_put(&g_wb, &k, e);
@@ -2457,6 +2458,11 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
     for (uint32_t i = 0; i < g_wb.cap && nl < 512; i++) {
         wb_ent *e = g_wb.vals ? g_wb.vals[i] : NULL;
         if (!e || e->t.mem >= z || e->t.mem + e->t.L.size <= a) continue;
+        /* Linear CPU readback targets share 16 KiB pages with other CPU-written query buffers. Invalidating the whole
+           target explicitly discards its CPU cache: a neighboring write must not suppress the GPU result (BotW
+           Magnesis picking). Keep the freshness heuristic for tiled textures / uploads and partial invalidations,
+           which must not overwrite potentially newer CPU bytes outside the requested range. */
+        e->invalidate_covers = nvn_tex_is_linear(&e->t.d) && e->t.mem >= a && e->t.mem + e->t.L.size <= z;
         uint64_t k = e->t.serial; nvn_hm_del(&g_wb, &k); list[nl++] = e; i = (uint32_t)-1;   // deletion shifts entries: rescan
     }
     pthread_mutex_unlock(&g_smu);
@@ -2470,7 +2476,7 @@ static void wb_write_list(wb_ent **list, int nl, int force) {
     /* Freshness is decided for every entry before anything is written back (a write-back marks its pages written), and
        of several renderings of the same memory (texture objects over it) only the newest is written back. */
     int fresh[512];
-    for (int i = 0; i < nl; i++) fresh[i] = force || !nvn_dirty_since(list[i]->t.mem, list[i]->t.L.size, list[i]->stamp);
+    for (int i = 0; i < nl; i++) fresh[i] = force || list[i]->invalidate_covers || !nvn_dirty_since(list[i]->t.mem, list[i]->t.L.size, list[i]->stamp);
     for (int i = 0; i < nl; i++) for (int j = 0; j < nl; j++)
         if (i != j && fresh[i] && fresh[j] && list[j]->t.mem == list[i]->t.mem && list[j]->stamp > list[i]->stamp) { fresh[i] = 2; break; }   // 2: superseded
     for (int i = 0; i < nl; i++) {
@@ -4320,7 +4326,12 @@ static void mfx_pass_setup(MTL4RenderPassDescriptor *pd) {
 /* TOTK_MFX: vertex shaders of the game's UI (layout panes, text, icons, the minimap); the first draw into the canvas with
    one of them ends the scene. */
 static int mfx_ui_vs(const char *key) {
+#if GAME_BOTW
+    /* BotW layout panes, text, minimap and HUD icons (observed canvas draws). */
+    static const char *const ui[] = {"62f5ad35", "5ecc1080", "35e3c821", "af249328", "3bd85812", "46c3223d", "06fe0642", "0efd7d0b", "d80c41a5", "08e93f03"};
+#else
     static const char *const ui[] = {"7f2113e2", "e9fd7b43", "a662e313", "16684efc", "3e11cee5", "48c18ae6", "35cbc686", "4872bec9", "9f47ed90"};
+#endif
     for (size_t i = 0; i < sizeof ui / sizeof *ui; i++) if (!strncmp(key, ui[i], 8)) return 1;
     return 0;
 }
@@ -4362,7 +4373,11 @@ static double uw_ui_squeeze(const char *vs, const p_draw *dw, const p_draw_idx *
        ratio over 16:9; the old ratio * th / tw only held for a 16:9 canvas. With key 4 off the picture is 16:9 again
        (stretched over a wide canvas, UI and all): nothing to squeeze. */
     double shown = uw_ratio(), f = shown * 9.0 / 16.0;
+#if GAME_BOTW
+    (void)f; return 1; /* BotW handles the complete layout below, including capture targets and text. */
+#else
     return f > 1.001 ? f : 1;
+#endif
 }
 /* TOTK_MFX: the scene is complete: end the pass (the draw that follows opens it again, loading the canvas, with the UI
    attachment) and copy the canvas into this frame's scene texture. */
@@ -6944,6 +6959,84 @@ static double g_ui_moff;
 static __strong id<MTLTexture> g_flash_hdr_source;   // diagnostic: tone-map input (may be reused later in the frame)
 static __strong id<MTLTexture> g_flash_tonemap_target; // diagnostic: tone-map output, before FXAA
 static int ui_mat_ok(void) { const p_bind_buf *u = &S.ubo[0][0]; void *mb; uint64_t mo; return u->addr && u->size >= 64 && u->size <= 4096 && !pend_hits(u->addr, u->size) && mtl_addr(u->addr, u->size, &mb, &mo); }
+#if GAME_BOTW
+#include "botw_ui_aspect.h"
+static int botw_ui_vertices(const p_draw *dw, const p_draw_idx *di, float P[6][4]) {
+    if(!S.nattr || S.attr[0].stream>=16)return 0;
+    va_st at=S.attr[0];vs_st stream=S.stream[at.stream];NVNbufferRange vb=S.vbuf[at.stream];
+    MTLVertexFormat vf=vfmt(at.fmt);
+    int nc=vf==MTLVertexFormatFloat2?2:vf==MTLVertexFormatFloat3?3:vf==MTLVertexFormatFloat4?4:0;
+    int n=dw?dw->count:di?di->count:0;
+    if(!nc || n<1 || n>6 || !stream.stride || stream.divisor || !vb.address)return 0;
+    unsigned char indices[24];int isz=di?(di->itype==0?1:di->itype==1?2:di->itype==2?4:0):0;
+    void *mb;uint64_t mo;
+    if(di && (!isz || !mtl_addr(di->ibuf,n*isz,&mb,&mo) || pend_read(di->ibuf,indices,n*isz,0)<0))return 0;
+    for(int i=0;i<n;i++) {
+        uint32_t index=0;if(di)memcpy(&index,indices+i*isz,isz);
+        int64_t vertex=dw?(int64_t)dw->first+i:(int64_t)index+di->base_vertex;
+        if(vertex<0 || (uint64_t)vertex>UINT64_MAX/stream.stride)return 0;
+        uint64_t offset=(uint64_t)vertex*stream.stride;
+        if(offset>vb.size || at.offset>vb.size-offset || nc*4>vb.size-offset-at.offset)return 0;
+        uint64_t addr=vb.address+offset+at.offset;
+        if(addr<vb.address || !mtl_addr(addr,nc*4,&mb,&mo))return 0;
+        P[i][0]=P[i][1]=P[i][2]=0;P[i][3]=1;
+        if(pend_read(addr,P[i],nc*4,0)<0)return 0;
+    }
+    return 1;
+}
+/* All layout programs, including text, use one transform. Only actual full-view
+   geometry sampling a screen capture (or a solid fade) may bypass it. */
+static void botw_ui_transform(NvProg *pr, const p_draw *dw, const p_draw_idx *di,
+                              NSUInteger tw, NSUInteger th, double *ux, double *uy) {
+    double aspect=uw_ratio(); const char *off=getenv("TOTK_UI_SQUEEZE");
+    if (!aspect || (off && !strcmp(off,"0")) || !pr || !pr->sh[0] || !mfx_ui_vs(pr->sh[0]->key) ||
+        !g_mfx.swap_w || tw<g_mfx.swap_w/8 || th<g_mfx.swap_h/8 ||
+        fabs((double)tw*g_mfx.swap_h / ((double)th*g_mfx.swap_w)-1)>.015) return;
+    int full=0, sampled=0, screen=0;
+    const char *key=pr->sh[0]->key;
+    int font=!strncmp(key,"d80c41a5",8) || !strncmp(key,"08e93f03",8);
+    int count=dw?dw->count:di?di->count:0, prim=dw?dw->prim:di?di->prim:-1;
+    const p_bind_buf *u=&S.ubo[0][0];
+    float m[136],P[6][4],xy[6][2];
+    int vpfull=!S.has_vp || (S.vp[0][0]==0 && S.vp[0][1]==0 && S.vp[0][2]==tw && S.vp[0][3]==th);
+    int scfull=!R.has_sc || (R.sc.x<=0 && R.sc.y<=0 && (long)R.sc.x+R.sc.w>=(long)tw && (long)R.sc.y+R.sc.h>=(long)th);
+    if (!font && vpfull && scfull && !S.poly.cull &&
+        ((prim==4 && count==6) || (prim==5 && count==4)) &&
+        u->addr && u->size>=sizeof m && pend_read(u->addr,m,sizeof m,0)>=0 && botw_ui_vertices(dw,di,P)) {
+        float shift=0;const p_bind_buf *u10=&S.ubo[0][10];
+        int valid=u10->addr && u10->size>=4 && pend_read(u10->addr,&shift,4,0)>=0 && isfinite(shift);
+        for(int i=0;i<count;i++) {
+            if(botw_ui_project(m,P[i],xy[i]))xy[i][0]+=shift; /* final clip-space X offset */
+            else valid=0;
+        }
+        if(valid)full=botw_ui_screen_quad((const float (*)[2])xy,count,prim==5);
+    }
+    NvShader *fs=pr->sh[1];
+    if(full && fs)for(int i=0;i<fs->rf.nb;i++) {
+        const nvn_rbind *b=&fs->rf.b[i];
+        if(b->kind!=NVN_RB_TEX || b->reg<0 || b->reg>=128)continue;
+        int tid=(int)(S.tex[1][b->reg]&0xfffff);
+        uint64_t serial=0;unsigned w=0,h=0;
+        registry_lock();
+        if(tid>0 && tid<g_ntreg && g_treg[tid].ok) {
+            const tex_t *t=&g_treg[tid].t;serial=t->serial;w=t->d.width;h=t->d.height;
+        }
+        registry_unlock();
+        if(w>1 || h>1)sampled=1;
+        if(serial && botw_ui_screen_texture(w,h,(unsigned)tw,(unsigned)th,gpu_owned(serial)))screen=1;
+    }
+    int fill=full && (screen || !sampled);
+    botw_ui_scale scale=botw_ui_fit(aspect,fill);*ux=1/scale.x;*uy=scale.y;
+    /* Bounded diagnostics: one record per shader and treatment, enabled explicitly. */
+    static int trace=-1; static char seen[32][10]; static int nseen;
+    if(trace<0)trace=getenv("TOTK_BOTW_UI_TRACE")!=NULL;
+    if(trace && nseen<32) {
+        char tag[10];snprintf(tag,sizeof tag,"%.8s%d",key,fill);int known=0;
+        for(int i=0;i<nseen;i++)known|=!strcmp(tag,seen[i]);
+        if(!known){strcpy(seen[nseen++],tag);MLOG("[botw-ui] %.8s target %lux%lu treatment %s scale %.5f,%.5f full-geometry %d screen-input %d",key,(unsigned long)tw,(unsigned long)th,fill?"screen fill":"layout fit",scale.x,scale.y,full,screen);}
+    }
+}
+#endif
 static uint64_t ui_mat_patch(const p_bind_buf *u, void *mb, uint64_t mo) {
     enum { RING = 4 << 20 }; static __strong id<MTLBuffer> ring; static uint64_t ring_gpu, la, ls, lp, lg; static size_t at; static double lo;
     if (!ring) { ring = [g_dev newBufferWithLength:RING options:MTLResourceStorageModeShared]; res_add(ring); ring_gpu = ring.gpuAddress; }
@@ -10006,7 +10099,13 @@ frz_plain:;
     if (moff != g_ui_moff) { g_ui_moff = moff; args_dirty_stage(0); }
     double ux = uw_ui_squeeze(pr && pr->sh[0] ? pr->sh[0]->key : NULL, dw, di, tw, th), cx = tw / 2.0;   // key 4: UI squeezed by 1 / ux about the canvas centre
     double vx = S.has_vp ? S.vp[0][0] : 0, vw = S.has_vp ? S.vp[0][2] : tw;
+    double uy = 1, cy = th / 2.0;
+#if GAME_BOTW
+    botw_ui_transform(pr, dw, di, tw, th, &ux, &uy);
+#endif
     if (ux != 1) { vx = cx + (vx - cx) / ux; vw /= ux; }
+    double vy = cy + ((S.has_vp ? S.vp[0][1] : 0) + vo - cy) * uy;
+    double vh = (S.has_vp ? S.vp[0][3] : th) * vs * uy;
     if ((atomic_load(&g_uw_log) > 0 && uw_on_canvas()) || atomic_load(&g_draw_log) > 0)
         MLOG("[uw] F%llu pass %llu ui %d squeeze %.3f vs %.8s fs %.8s count %u inst %d vp %s%g,%g,%g,%g sc %s%d,%d,%d,%d blend %#x tex %ux%u fmt %#x ser %llu bl %u,%u,%u/%u,%u,%u cm %#x prim %d",
              (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, g_uw_ui, ux, pr && pr->sh[0] ? pr->sh[0]->key : "-", pr && pr->sh[1] ? pr->sh[1]->key : "-",
@@ -10039,14 +10138,16 @@ frz_plain:;
        (foliage is drawn twice, the second time against the first one's depth with an equal test); full-screen
        triangles and quads (lighting, post) stay put, a moved one leaves lines of stale pixels. */
     double jx = 0, jy = 0; unsigned nv = di ? di->count : dw ? dw->count : 0;
-    if (taa_jittered() && nv > 6 && vo == 0 && vs == 1 && ux == 1) taa_jitter(&jx, &jy);
-    if (S.has_vp) enc_r_viewport(en, (MTLViewport){vx + jx, S.vp[0][1] + vo + jy, vw, S.vp[0][3] * vs, S.dr[0], S.dr[1]});
-    else enc_r_viewport(en, (MTLViewport){vx + jx, vo + jy, vw, th * vs, 0, 1});
+    if (taa_jittered() && nv > 6 && vo == 0 && vs == 1 && ux == 1 && uy == 1) taa_jitter(&jx, &jy);
+    if (S.has_vp) enc_r_viewport(en, (MTLViewport){vx + jx, vy + jy, vw, vh, S.dr[0], S.dr[1]});
+    else enc_r_viewport(en, (MTLViewport){vx + jx, vy + jy, vw, vh, 0, 1});
     MTLScissorRect sc = {0, 0, tw, th};
     if (R.has_sc) {
         long sx0 = R.sc.x, sx1 = (long)R.sc.x + R.sc.w;
         if (ux != 1) { sx0 = lround(cx + (sx0 - cx) / ux); sx1 = lround(cx + (sx1 - cx) / ux); }
         long x0 = sx0 < 0 ? 0 : sx0, y0 = R.sc.y <= 0 ? 0 : R.sc.y + so, x1 = sx1, y1 = vs != 1 ? (long)th : (long)R.sc.y + R.sc.h + so;
+        if (uy != 1) { y0 = lround(cy + (y0 - cy) * uy); y1 = lround(cy + (y1 - cy) * uy); }
+        if (y0 < 0) y0 = 0;
         if (x1 > (long)tw) x1 = tw; if (y1 > (long)th) y1 = th;
         if (x1 <= x0 || y1 <= y0) { g_draw_skip[10]++; return; }
         sc = (MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)};

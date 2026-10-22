@@ -7,6 +7,57 @@
 #include "nvn_tex.h"
 #include <string.h>
 #include <time.h>
+#include <execinfo.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Optional, bounded CPU readback diagnostics. In-process tracing avoids a debugger intercepting the runtime's
+   intentional memory/instruction faults. Never dump pool contents: record only ranges and caller addresses.
+   TOTK_READBACK_TRACE=1, TOTK_READBACK_TRACE_DELAY=40 (seconds after the first invalidate; 0..180). */
+extern void runtime_describe_address(uint64_t, char *, size_t) __attribute__((weak_import));
+static pthread_once_t readback_trace_once = PTHREAD_ONCE_INIT;
+static int readback_trace_enabled;
+static unsigned readback_trace_delay = 40;
+static uint64_t readback_trace_start;
+static _Atomic unsigned readback_trace_count;
+static uint64_t readback_trace_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+static void readback_trace_init(void) {
+    const char *e = getenv("TOTK_READBACK_TRACE");
+    if (!e || strcmp(e, "1")) return;
+    e = getenv("TOTK_READBACK_TRACE_DELAY");
+    if (e && *e) {
+        char *end; unsigned long v = strtoul(e, &end, 10);
+        if (!*end && v <= 180) readback_trace_delay = (unsigned)v;
+    }
+    readback_trace_start = readback_trace_ns();
+    readback_trace_enabled = 1;
+    fprintf(stderr, "[readback-trace] armed: delay=%u seconds, limit=64 calls; pool contents excluded\n", readback_trace_delay);
+}
+static void readback_trace(const pool_t *p, ptrdiff_t off, size_t n) {
+    pthread_once(&readback_trace_once, readback_trace_init);
+    if (!readback_trace_enabled || atomic_load_explicit(&readback_trace_count, memory_order_relaxed) >= 64) return;
+    if (readback_trace_ns() - readback_trace_start < (uint64_t)readback_trace_delay * 1000000000ull) return;
+    unsigned sample = atomic_fetch_add_explicit(&readback_trace_count, 1, memory_order_relaxed);
+    if (sample >= 64) return;
+    void *frames[20]; int count = backtrace(frames, 20);
+    flockfile(stderr);
+    fprintf(stderr, "[readback-trace] call=%u pool=%p memory=%p offset=%lld bytes=%zu\n", sample + 1,
+            (const void *)p, p ? (void *)p->mem : NULL, (long long)off, n);
+    for (int i = 0; i < count; i++) {
+        char label[160];
+        if (runtime_describe_address) runtime_describe_address((uint64_t)(uintptr_t)frames[i], label, sizeof label);
+        else snprintf(label, sizeof label, "%p", frames[i]);
+        fprintf(stderr, "[readback-trace]   caller %d %s\n", i, label);
+    }
+    if (sample == 63) fprintf(stderr, "[readback-trace] complete: 64 calls captured\n");
+    funlockfile(stderr);
+}
 
 // ---------- Debug labels, markers, groups, checkpoints: meaningful only to NVN debugging tools ----------
 NVN(nvnDeviceSetDebugLabel, void, NVNdevice *o, const char *s) { (void)o; (void)s; }
@@ -45,7 +96,9 @@ NVN(nvnDeviceGetTimestampInNanoseconds, uint64_t, const NVNdevice *d, const NVNc
 NVN(nvnMemoryPoolGetSize, size_t, const NVNmemoryPool *p) { return (size_t)((const pool_t *)p)->size; }
 // The CPU is about to read what the GPU wrote: GPU renderings into this pool's textures are written back (nvn_mtl.m).
 void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n);
-NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { if (off >= 0) mtl_pool_invalidate((const pool_t *)p, (uint64_t)off, n); }
+NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
+    if (off >= 0) { readback_trace((const pool_t *)p, off, n); mtl_pool_invalidate((const pool_t *)p, (uint64_t)off, n); }
+}
 NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *b, ptrdiff_t off, size_t n) { (void)b; (void)off; (void)n; }
 
 // ---------- Texture builder and texture queries ----------
