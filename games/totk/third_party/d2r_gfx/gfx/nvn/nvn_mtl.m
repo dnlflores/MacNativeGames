@@ -2205,6 +2205,17 @@ static int gpu_owned(uint64_t k) { pthread_mutex_lock(&g_smu); int d = totk_seri
 
 static uint64_t *g_dead_put; static int g_dead_put_n, g_dead_put_cap; static uint64_t g_dead_put_total;
 static int serial_is_dead(uint64_t k) { pthread_mutex_lock(&g_smu); int d = totk_serial_has(&g_dead_serial, k); pthread_mutex_unlock(&g_smu); return d; }
+/* A texture-pool registration or a recorded command whose serial was finalised follows its storage to the texture living
+   there (tex_by_id, botw_tex_follow), as an NVN descriptor addresses memory. The swizzle stays the one it was made with:
+   BotW's pause menu initialises two textures over its backdrop capture every frame, the render target (identity swizzle)
+   and the one the masked backdrop draw samples (alpha forced to one). Taking the render target's swizzle sampled the
+   capture's zero alpha, so for that frame the backdrop vanished and the inventory's side columns showed unfaded (about
+   1 frame in 100). TOTK_FOLLOW_SWIZZLE=0 takes the live texture's swizzle (A/B). */
+static void follow_keep_swizzle(tex_t *live, const tex_t *was) {
+    static int keep = -1; if (keep < 0) { const char *e = getenv("TOTK_FOLLOW_SWIZZLE"); keep = !(e && !strcmp(e, "0")); }
+    if (!keep) return;
+    live->d.swizzle_r = was->d.swizzle_r; live->d.swizzle_g = was->d.swizzle_g; live->d.swizzle_b = was->d.swizzle_b; live->d.swizzle_a = was->d.swizzle_a;
+}
 /* 2026-10-20: a finalised serial is forgotten (dropped from g_dead_serial and g_gpu_owned) once nothing can bring it back:
    no recording copy names it (dm_nvn_pin_has_serial: only a recording's texture copy brings a serial to the replay) and
    no texture-pool slot is registered with it (g_treg_refs, kept by mtl_reg_tex and tex_by_id's redirect: such a slot still
@@ -5484,6 +5495,7 @@ static id<MTLTexture> tex_by_id(int tid) {   // 调用方持 g_rmu | Caller hold
             if (rp->view) treg_clear_view_locked(tid);
             if (totk_life_on() && totk_life_match(&live)) totk_life_log("use fc=%llu id=%d redirect %llu -> %llu mem=%p", (unsigned long long)atomic_load(&g_cur_frame), tid, (unsigned long long)rp->t.serial, (unsigned long long)live.serial, (void *)live.mem);
             treg_ref_locked(live.serial, 1); treg_ref_locked(rp->t.serial, -1); uint64_t was_ = rp->t.serial;
+            follow_keep_swizzle(&live, &rp->t);
             rp->t = live; if (tid < (1 << 20)) atomic_store_explicit(&g_tser[tid], live.serial, memory_order_release);
             serial_forget_locked_rmu(was_);
             dead = 0;
@@ -14385,6 +14397,7 @@ void botw_tex_follow(const void *tv) {
                           (unsigned long long)live.L.size, t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.format, t->d.target, (unsigned long long)t->L.size);
         return;
     }
+    follow_keep_swizzle(&live, t);
     uint64_t from = t->serial; int pinned = dm_nvn_pin_rekey(t, &live);
     if (!pinned) *t = live;
     static uint64_t n; if (n++ < 8 || n % 1000 == 0)
