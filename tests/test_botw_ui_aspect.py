@@ -21,12 +21,13 @@ int main(void){{
  int whole=botw_ui_whole_copy(1280,720,1280,720,0,0,0,0,1280,720);
  assert(whole);
  /* Rendered scene -> capture -> second copy, with neither destination itself
-    rendered into. Both must keep screen mapping, including partial UI panes. */
+    rendered into. Both count as screen content; drawn back over the full view
+    (a scissor may crop it) they keep screen mapping. */
  botw_ui_capture_copy(&copies,1,2,1,whole);
  botw_ui_capture_copy(&copies,2,3,0,whole);
  for(int serial=2;serial<=3;serial++){{
   int screen=botw_ui_screen_texture(1280,720,2560,1764,totk_serial_has(&copies,serial));
-  botw_ui_scale scale=botw_ui_composite(2816.0/1940,0,screen,1);
+  botw_ui_scale scale=botw_ui_fit(2816.0/1940,botw_ui_screen_fill(1,0,screen,1,0));
   assert(screen && scale.x==1 && scale.y==1);
  }}
  /* Same-sized static artwork cannot become a capture just by being copied. */
@@ -67,17 +68,29 @@ int main(void){{
   /* Every ordinary pane, logo and glyph fits; none expands past screen edges. */
   assert(layout.x<=1 && layout.y<=1 && layout.x>0 && layout.y>0);
   assert(screen.x==1 && screen.y==1);
-  /* Pause backgrounds may be split or clipped: captured screen coordinates
-     must agree across full and partial panes, including their scissors. */
-  botw_ui_scale partial=botw_ui_composite(a,0,1,1);
-  botw_ui_scale whole=botw_ui_composite(a,1,1,1);
-  assert(partial.x==whole.x && partial.y==whole.y && partial.y==1);
+  /* Pause backgrounds: a full-view capture keeps screen mapping, also when a
+     scissor crops it. */
+  botw_ui_scale whole=botw_ui_fit(a,botw_ui_screen_fill(1,1,1,1,0));
+  botw_ui_scale cropped=botw_ui_fit(a,botw_ui_screen_fill(1,0,1,1,0));
+  assert(whole.x==1 && whole.y==1 && cropped.x==1 && cropped.y==1);
+  /* A smaller pane sampling a capture (frosted quick-select slot, item card,
+     pickup label) is fitted with its frame and text. */
+  botw_ui_scale frosted=botw_ui_fit(a,botw_ui_screen_fill(0,1,1,1,0));
+  assert(frosted.x==layout.x && frosted.y==layout.y);
   /* A sampled panel/artwork or a partial solid stays in the ordinary UI fit. */
-  botw_ui_scale panel=botw_ui_composite(a,0,0,1);
-  botw_ui_scale solid=botw_ui_composite(a,0,0,0);
+  botw_ui_scale panel=botw_ui_fit(a,botw_ui_screen_fill(0,1,0,1,0));
+  botw_ui_scale solid=botw_ui_fit(a,botw_ui_screen_fill(0,1,0,0,0));
   assert(panel.x==layout.x && panel.y==layout.y);
   assert(solid.x==layout.x && solid.y==layout.y);
+  /* Full-view solid fades fill unless scissored; full-view artwork keeps its
+     proportions unless its quad overhangs the view (vignettes). */
+  assert(botw_ui_screen_fill(1,1,0,0,0) && !botw_ui_screen_fill(1,0,0,0,0));
+  assert(!botw_ui_screen_fill(1,1,0,1,0) && botw_ui_screen_fill(1,1,0,1,1) && !botw_ui_screen_fill(1,0,0,1,1));
  }}
+ /* The quick-select vignette's quad reaches 1.778 past the view vertically. */
+ const float vignette[4][2]={{{{-1,-1.778f}},{{1,-1.778f}},{{-1,1.778f}},{{1,1.778f}}}};
+ const float exact[4][2]={{{{-1,-1}},{{1,-1}},{{-1,1}},{{1,1}}}};
+ assert(botw_ui_overhang(vignette,4) && !botw_ui_overhang(exact,4));
  float m[136]={{0}};m[0]=2.0f/1280;m[5]=2.0f/720;m[10]=m[15]=1;
  m[16]=m[21]=m[26]=1;m[132]=1280;m[133]=720;m[134]=-640;m[135]=360;
  const float quad[6][4]={{{{0,0,0,1}},{{1,0,0,1}},{{0,1,0,1}},{{1,0,0,1}},{{1,1,0,1}},{{0,1,0,1}}}};

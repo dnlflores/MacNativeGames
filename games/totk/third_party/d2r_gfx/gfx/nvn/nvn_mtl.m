@@ -7021,16 +7021,17 @@ static int botw_ui_vertices(const p_draw *dw, const p_draw_idx *di, float P[6][4
     }
     return 1;
 }
-/* Ordinary layout programs, including text, use one transform. Screen capture
-   panes keep screen coordinates even when pause composition crops their geometry.
-   Solid fades bypass layout fitting only after proving full-view coverage. */
+/* Ordinary layout programs, including text, use one transform. Full-view screen
+   captures keep screen coordinates even when a scissor crops them; solid fades and
+   overhanging overlays bypass layout fitting only after proving full-view coverage
+   (botw_ui_screen_fill). */
 static void botw_ui_transform(NvProg *pr, const p_draw *dw, const p_draw_idx *di,
                               NSUInteger tw, NSUInteger th, double *ux, double *uy) {
     double aspect=uw_ratio(); const char *off=getenv("TOTK_UI_SQUEEZE");
     if (!aspect || (off && !strcmp(off,"0")) || !pr || !pr->sh[0] || !mfx_ui_vs(pr->sh[0]->key) ||
         !g_mfx.swap_w || tw<g_mfx.swap_w/8 || th<g_mfx.swap_h/8 ||
         fabs((double)tw*g_mfx.swap_h / ((double)th*g_mfx.swap_w)-1)>.015) return;
-    int full=0, sampled=0, screen=0;
+    int full=0, sampled=0, screen=0, overhang=0;
     const char *key=pr->sh[0]->key;
     int font=!strncmp(key,"d80c41a5",8) || !strncmp(key,"08e93f03",8);
     int count=dw?dw->count:di?di->count:0, prim=dw?dw->prim:di?di->prim:-1;
@@ -7038,7 +7039,7 @@ static void botw_ui_transform(NvProg *pr, const p_draw *dw, const p_draw_idx *di
     float m[136],P[6][4],xy[6][2];
     int vpfull=!S.has_vp || (S.vp[0][0]==0 && S.vp[0][1]==0 && S.vp[0][2]==tw && S.vp[0][3]==th);
     int scfull=!R.has_sc || (R.sc.x<=0 && R.sc.y<=0 && (long)R.sc.x+R.sc.w>=(long)tw && (long)R.sc.y+R.sc.h>=(long)th);
-    if (!font && vpfull && scfull && !S.poly.cull &&
+    if (!font && vpfull && !S.poly.cull &&
         ((prim==4 && count==6) || (prim==5 && count==4)) &&
         u->addr && u->size>=sizeof m && pend_read(u->addr,m,sizeof m,0)>=0 && botw_ui_vertices(dw,di,P)) {
         float shift=0;const p_bind_buf *u10=&S.ubo[0][10];
@@ -7047,7 +7048,7 @@ static void botw_ui_transform(NvProg *pr, const p_draw *dw, const p_draw_idx *di
             if(botw_ui_project(m,P[i],xy[i]))xy[i][0]+=shift; /* final clip-space X offset */
             else valid=0;
         }
-        if(valid)full=botw_ui_screen_quad((const float (*)[2])xy,count,prim==5);
+        if(valid){full=botw_ui_screen_quad((const float (*)[2])xy,count,prim==5);overhang=full && botw_ui_overhang((const float (*)[2])xy,count);}
     }
     static int trace=-1; static char seen[64][40]; static int nseen;
     if(trace<0)trace=getenv("TOTK_BOTW_UI_TRACE")!=NULL;
@@ -7067,11 +7068,12 @@ static void botw_ui_transform(NvProg *pr, const p_draw *dw, const p_draw_idx *di
         if(w>1 || h>1)sampled=1;
         if(serial && (diag || atomic_load(&g_draw_log)>0) && nst<sizeof seen_tex-24)
             nst+=snprintf(seen_tex+nst,sizeof seen_tex-nst," %ux%u%s",w,h,copied?"s":botw_ui_screen_content(serial)?"r":"");
-        /* Copied or filtered screen pixels keep the screen mapping whatever their shape (strips, full captures). */
+        /* Copied or filtered screen pixels count as screen content whatever their texture's shape (strips, full
+           captures); botw_ui_screen_fill then decides the mapping from the quad. */
         if(copied || (serial && botw_ui_screen_texture(w,h,(unsigned)tw,(unsigned)th,botw_ui_screen_content(serial))))screen=1;
     }
-    int fill=screen || (full && !sampled);
-    botw_ui_scale scale=botw_ui_composite(aspect,full,screen,sampled);*ux=1/scale.x;*uy=scale.y;
+    int fill=botw_ui_screen_fill(full,scfull,screen,sampled,overhang);
+    botw_ui_scale scale=botw_ui_fit(aspect,fill);*ux=1/scale.x;*uy=scale.y;
     /* Bounded diagnostics: one record per shader, treatment and inputs, enabled explicitly. */
     if(diag) {
         char tag[40];snprintf(tag,sizeof tag,"%.8s%d%s",key,fill,seen_tex);int known=0;

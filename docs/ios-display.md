@@ -6,11 +6,13 @@ Turning it off explicitly selects original 16:9. Preserve this default while
 fixing menu composition: the owner rejected the temporary build 10 letterbox
 rollback. Native resolution, enhancements and mod preparation remain unchanged.
 
-Pause-menu backgrounds can be composed from several partial capture panes, so
-full-screen geometry is not a prerequisite for a screen-copy treatment. These
-layers must retain their screen mapping rather than receive the ordinary UI fit
-a second time. Static artwork and character previews must remain separate.
-On-device verification is still required for the remaining pause composition.
+Pause-menu backgrounds are full-view quads that draw a screen capture back; they
+retain their screen mapping (also when a scissor crops them) rather than receive
+the ordinary UI fit a second time. Smaller panes that sample a capture are frosted
+UI elements (quick-select slot frames and backgrounds, the inventory item card, the
+item-name box over pickups): they follow the layout fit with their frames and text,
+otherwise they sit off their frames. Static artwork and character previews remain
+separate.
 
 The frontend configures `TOTK_BOTW_RES`, `TOTK_OPERATION_MODE=docked`, and
 `TOTK_ASPECT` before the loader sizes memory. `TOTK_IOS_MATCH_DISPLAY=0` keeps
@@ -27,8 +29,10 @@ rule; it does not depend on the preceding frame's last canvas texture. Fixed 16:
 menu artwork is fitted with its proportions and contents preserved. It may leave
 bars in menus; 3D gameplay still fills the display.
 
-GPU-produced screen captures keep screen mapping for full or partial panes.
-Solid fades use that treatment only for actual full-view quad geometry. The renderer fetches vertices/indices and
+GPU-produced screen captures keep screen mapping on full-view quads; solid fades
+only on unscissored full-view quads; full-view artwork only when its quad overhangs
+the view by more than 10% (the quick-select vignette reaches 1.78x the view height:
+fitted, its edges showed as bars). See `botw_ui_screen_fill`. The renderer fetches vertices/indices and
 uniforms from their pending-update snapshots and projects them to check coverage.
 Shared quad dimensions alone do not establish an element's bounds. This avoids
 mistaking menu panels, HUD icons or logos for backgrounds and enlarging them.

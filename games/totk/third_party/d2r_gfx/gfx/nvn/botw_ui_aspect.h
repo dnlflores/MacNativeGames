@@ -7,12 +7,20 @@ static inline botw_ui_scale botw_ui_fit(double aspect, int screen_fill) {
     if (screen_fill || !isfinite(f) || f <= 0 || fabs(f-1) < .001) return (botw_ui_scale){1,1};
     return f < 1 ? (botw_ui_scale){1,f} : (botw_ui_scale){1/f,1};
 }
-/* Capture panes already contain the screen projection, including any HUD. Pause
-   composition can crop them into several rectangles; fitting a partial pane a
-   second time displaces its edges relative to the other captured rectangles.
-   Only solid fades still require proof of full-view geometry. */
-static inline botw_ui_scale botw_ui_composite(double aspect, int full, int screen, int sampled) {
-    return botw_ui_fit(aspect, screen || (full && !sampled));
+/* Draws that keep screen mapping instead of the 16:9 layout fit, all on full-view quad
+   geometry: a screen capture drawn back (a scissor may crop it; pause backgrounds),
+   an unscissored solid fade, and an unscissored overlay whose quad overhangs the view
+   (vignettes: the game never showed their edges, which the fit would bring into view
+   as bars). Smaller panes that sample a capture (frosted quick-select slots, the item
+   card) belong to the layout like their frames and text, so they are fitted too. */
+static inline int botw_ui_screen_fill(int full, int scissor_full, int screen, int sampled, int overhang) {
+    if (!full) return 0;
+    return screen || (scissor_full && (!sampled || overhang));
+}
+/* A quad reaching more than 10% past the view on some side. */
+static inline int botw_ui_overhang(const float xy[][2], int n) {
+    for (int i=0;i<n;i++) if (fabs(xy[i][0])>1.1 || fabs(xy[i][1])>1.1) return 1;
+    return 0;
 }
 /* Quick-select blur/capture buffers retain the game's original 16:9 dimensions.
    Only GPU-produced images can qualify; artwork/atlases uploaded from disk cannot. */
