@@ -7043,7 +7043,7 @@ static void botw_ui_transform(NvProg *pr, const p_draw *dw, const p_draw_idx *di
     if (!aspect || (off && !strcmp(off,"0")) || !pr || !pr->sh[0] || !mfx_ui_vs(pr->sh[0]->key) ||
         !g_mfx.swap_w || tw<g_mfx.swap_w/8 || th<g_mfx.swap_h/8 ||
         fabs((double)tw*g_mfx.swap_h / ((double)th*g_mfx.swap_w)-1)>.015) return;
-    int full=0, sampled=0, screen=0, overhang=0;
+    int full=0, slid=0, sampled=0, screen=0, overhang=0;
     const char *key=pr->sh[0]->key;
     int font=!strncmp(key,"d80c41a5",8) || !strncmp(key,"08e93f03",8);
     int count=dw?dw->count:di?di->count:0, prim=dw?dw->prim:di?di->prim:-1;
@@ -7060,7 +7060,8 @@ static void botw_ui_transform(NvProg *pr, const p_draw *dw, const p_draw_idx *di
             if(botw_ui_project(m,P[i],xy[i]))xy[i][0]+=shift; /* final clip-space X offset */
             else valid=0;
         }
-        if(valid){full=botw_ui_screen_quad((const float (*)[2])xy,count,prim==5);overhang=full && botw_ui_overhang((const float (*)[2])xy,count);}
+        if(valid){full=botw_ui_screen_quad((const float (*)[2])xy,count,prim==5);overhang=full && botw_ui_overhang((const float (*)[2])xy,count);
+                  slid=!full && botw_ui_quad((const float (*)[2])xy,count,prim==5,1);}
     }
     static int trace=-1; static char seen[64][40]; static int nseen;
     if(trace<0)trace=getenv("TOTK_BOTW_UI_TRACE")!=NULL;
@@ -7084,6 +7085,11 @@ static void botw_ui_transform(NvProg *pr, const p_draw *dw, const p_draw_idx *di
            captures); botw_ui_screen_fill then decides the mapping from the quad. */
         if(copied || (serial && botw_ui_screen_texture(w,h,(unsigned)tw,(unsigned)th,botw_ui_screen_content(serial))))screen=1;
     }
+    /* The pause menu's page switch slides the old page's screen capture out and the new page's backdrop in as
+       view-sized quads offset sideways. Drawing a screen capture, they keep screen mapping like the settled quad;
+       fitted, the capture shrank to the 16:9 band for the slide and jumped back when it ended. Offset artwork stays
+       fitted. */
+    if(slid && screen)full=1;
     int fill=botw_ui_screen_fill(full,scfull,screen,sampled,overhang);
     botw_ui_scale scale=botw_ui_fit(aspect,fill);*ux=1/scale.x;*uy=scale.y;
     /* Bounded diagnostics: one record per shader, treatment and inputs, enabled explicitly. */

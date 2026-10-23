@@ -8,7 +8,9 @@ rollback. Native resolution, enhancements and mod preparation remain unchanged.
 
 Pause-menu backgrounds are full-view quads that draw a screen capture back; they
 retain their screen mapping (also when a scissor crops them) rather than receive
-the ordinary UI fit a second time. Smaller panes that sample a capture are frosted
+the ordinary UI fit a second time. That includes the page switch (L/R), which slides
+the old page's capture out and the new page's backdrop in as view-sized quads
+offset sideways; fitted, they shrank to the 16:9 band for the slide. Smaller panes that sample a capture are frosted
 UI elements (quick-select slot frames and backgrounds, the inventory item card, the
 item-name box over pickups): they follow the layout fit with their frames and text,
 otherwise they sit off their frames. Static artwork and character previews remain

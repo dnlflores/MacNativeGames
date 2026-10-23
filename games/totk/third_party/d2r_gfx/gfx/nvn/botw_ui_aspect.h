@@ -43,15 +43,18 @@ static inline int botw_ui_project(const float *m, const float p[4], float xy[2])
     return 1;
 }
 /* A quad must cover all four NDC corners with two triangles sharing a diagonal.
-   A bounding box alone also accepts overlapping triangles with uncovered pixels. */
-static inline int botw_ui_screen_quad(const float xy[][2], int n, int strip) {
+   A bounding box alone also accepts overlapping triangles with uncovered pixels.
+   shifted: instead of covering the view, the quad has exactly the view's size at
+   any offset (a page sliding in or out). */
+static inline int botw_ui_quad(const float xy[][2], int n, int strip, int shifted) {
     if ((!strip && n!=6) || (strip && n!=4)) return 0;
     double lo[2]={xy[0][0],xy[0][1]},hi[2]={xy[0][0],xy[0][1]};
     for(int i=0;i<n;i++)for(int a=0;a<2;a++) {
         if (!isfinite(xy[i][a])) return 0;
         lo[a]=fmin(lo[a],xy[i][a]);hi[a]=fmax(hi[a],xy[i][a]);
     }
-    if(lo[0]>-.9999 || lo[1]>-.9999 || hi[0]<.9999 || hi[1]<.9999) return 0;
+    if(shifted ? fabs(hi[0]-lo[0]-2)>.001 || fabs(hi[1]-lo[1]-2)>.001
+               : lo[0]>-.9999 || lo[1]>-.9999 || hi[0]<.9999 || hi[1]<.9999) return 0;
     unsigned corner[6],masks[2]={0,0};
     for(int i=0;i<n;i++) {
         unsigned c=0;
@@ -66,3 +69,4 @@ static inline int botw_ui_screen_quad(const float xy[][2], int n, int strip) {
     return (masks[0]|masks[1])==15 && (both==6 || both==9) &&
            __builtin_popcount(masks[0])==3 && __builtin_popcount(masks[1])==3;
 }
+static inline int botw_ui_screen_quad(const float xy[][2], int n, int strip) { return botw_ui_quad(xy,n,strip,0); }

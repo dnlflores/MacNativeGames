@@ -103,6 +103,14 @@ int main(void){{
  /* Even a full-size quad translated partly outside the view cannot count. */
  m[19]=128;for(int i=0;i<6;i++)assert(botw_ui_project(m,quad[i],xy[i]));
  assert(!botw_ui_screen_quad((const float (*)[2])xy,6,0));
+ /* It is a view-sized quad slid sideways: the pause menu's page switch slides its
+    screen captures this way, and the caller keeps those (only) in screen mapping. */
+ assert(botw_ui_quad((const float (*)[2])xy,6,0,1));
+ const float slid[4][2]={{{{1.656f,-1}},{{3.656f,-1}},{{1.656f,1}},{{3.656f,1}}}};
+ assert(botw_ui_quad(slid,4,1,1) && !botw_ui_screen_quad(slid,4,1));
+ /* A smaller pane slid the same way is not view-sized. */
+ for(int i=0;i<6;i++){{float v[4]={{quad[i][0]*.9f,quad[i][1],0,1}};assert(botw_ui_project(m,v,xy[i]));}}
+ assert(!botw_ui_quad((const float (*)[2])xy,6,0,1));
  /* Layout captures can use a perspective UI camera with constant w != 1. */
  m[19]=0;m[27]=-10;m[12]=m[13]=m[15]=0;m[14]=-1;
  m[0]*=10;m[5]*=10;
