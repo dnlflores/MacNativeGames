@@ -2445,6 +2445,20 @@ static int tilelog_match(const tex_t *t) {
 }
 #define TILELOG(t, fmt, ...) do { BOTW_TILELOG_NOTE(t) if (tilelog_match(t)) MLOG("[tile] f%llu ser=%llu mem=%p nvnfmt=%#x lv%u " fmt, (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)(t)->serial, (void *)(t)->mem, (t)->d.format, (t)->d.levels, ##__VA_ARGS__); } while (0)
 static void wb_ent_free(wb_ent *e) { if (!e) return; if (e->obj) { defer_obj_release((__bridge id)e->obj); CFRelease(e->obj); } free(e); }
+/* Linear render targets in CPU-visible pools are readback targets: BotW renders each water type's colour into a 1x1
+   RGBA32F linear texture and reads the pixel back with the CPU two frames later, after nvnMemoryPoolMap, without an
+   invalidate. On hardware the GPU wrote that memory; here the rendering stays in the MTLTexture until an invalidate,
+   so the game read the zeros it started with, its water colour table stayed zero and water drew grey / red with no
+   tint. Their renderings (wb_note) are listed here and written back when the CPU maps their pool (mtl_pool_map), as
+   an invalidate of the whole texture would. TOTK_MAP_WRITEBACK=0 turns it off (A/B). */
+typedef struct { uint64_t serial; const uint8_t *lo, *hi; } wb_lin;
+static wb_lin g_wb_lin[64]; static _Atomic int g_wb_nlin;   // g_smu
+static void wb_linear_add(const tex_t *t) {
+    int n = atomic_load(&g_wb_nlin);
+    for (int i = 0; i < n; i++) if (g_wb_lin[i].serial == t->serial) return;
+    if (n == 64) { static int said; if (!said++) MLOG("[writeback] more than 64 linear renderings wait for write-back: the oldest is left to an invalidate"); memmove(g_wb_lin, g_wb_lin + 1, 63 * sizeof *g_wb_lin); n = 63; }
+    g_wb_lin[n] = (wb_lin){t->serial, t->mem, t->mem + t->L.size}; atomic_store(&g_wb_nlin, n + 1);
+}
 static void wb_note(const tex_t *t) {
     TILELOG(t, "GPU render (owned %d)", gpu_owned(t->serial));
     if (!atomic_load(&g_wb_on) || !t->mem || !t->L.size) return;
@@ -2459,6 +2473,7 @@ static void wb_note(const tex_t *t) {
     e = calloc(1, sizeof *e); if (!e) MDIE("write-back record");
     e->t = *t; e->stamp = stamp; e->obj = (void *)CFBridgingRetain(o);
     nvn_hm_put(&g_wb, &k, e);
+    if (nvn_tex_is_linear(&t->d)) wb_linear_add(t);
     pthread_mutex_unlock(&g_smu);
 }
 static int wb_level_back(const tex_t *t, id<MTLTexture> mt, unsigned level, unsigned layer) {
@@ -2513,6 +2528,23 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
         e->invalidate_covers = nvn_tex_is_linear(&e->t.d) && e->t.mem >= a && e->t.mem + e->t.L.size <= z;
         uint64_t k = e->t.serial; nvn_hm_del(&g_wb, &k); list[nl++] = e; i = (uint32_t)-1;   // deletion shifts entries: rescan
     }
+    pthread_mutex_unlock(&g_smu);
+    wb_write_list(list, nl, 0);
+}
+void mtl_pool_map(const pool_t *p) {
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_MAP_WRITEBACK"); on = !(e && !strcmp(e, "0")); }
+    if (!on || !p || !p->mem || !atomic_load(&g_wb_nlin) || !atomic_load(&g_wb_on)) return;
+    const uint8_t *a = p->mem, *z = a + p->size;
+    wb_ent *list[64]; int nl = 0;
+    pthread_mutex_lock(&g_smu);
+    int n = atomic_load(&g_wb_nlin), keep = 0;
+    for (int i = 0; i < n; i++) {
+        wb_lin l = g_wb_lin[i];
+        if (l.lo >= z || l.hi <= a) { g_wb_lin[keep++] = l; continue; }
+        uint64_t k = l.serial; wb_ent *e = nvn_hm_get(&g_wb, &k);   // gone: an invalidate or a GPU copy took it
+        if (e) { nvn_hm_del(&g_wb, &k); e->invalidate_covers = 1; list[nl++] = e; }
+    }
+    atomic_store(&g_wb_nlin, keep);
     pthread_mutex_unlock(&g_smu);
     wb_write_list(list, nl, 0);
 }
