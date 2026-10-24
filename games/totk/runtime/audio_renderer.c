@@ -89,13 +89,19 @@ static void update_voice(AudioRenderer *r, const AudrenVoiceIn *in) {
 /* No samples (no memory, no size or an empty range): the DSP decodes nothing and counts the buffer as played when it
    reaches it, so a stream's empty last buffer does not hold up the buffers queued behind it. */
 int audio_buffer_empty(const AudrenWaveBuffer *b) { return !b->address || !b->size || b->end <= b->start; }
+/* A wave buffer marked end of stream resets the voice's played-sample count and playback goes on with the next queued
+   buffer in the same block, as on the DSP. Breath of the Wild marks every 14,336-sample chunk of its streamed music and
+   loading-screen sound (six mono voices) that way: stopping the voice for the rest of the block there silenced the
+   stream for up to 5 ms every 0.3 s, a pulsing sound at start and on loading screens. TOTK_AUDIO_EOS_STOP=1: old
+   behaviour (A/B). */
+int audio_eos_stops(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_AUDIO_EOS_STOP"); v = e && !strcmp(e, "1"); } return v; }
 static void skip_empty(AudioRenderer *r, ServerVoice *v) {
     while (v->valid[v->index] && audio_buffer_empty(&v->buffers[v->index])) {
         const AudrenWaveBuffer *b = &v->buffers[v->index];
         if (b->loop && b->loop_count < 0) break;   /* an endless empty loop starves the voice, as on the DSP */
         v->valid[v->index] = 0; v->consumed++; v->offset = 0; v->loops_done = 0; v->index = (v->index + 1) & 3;
         if (r) r->empty_played++;
-        if (b->end_of_stream) { v->played = 0; break; }
+        if (b->end_of_stream) { v->played = 0; if (audio_eos_stops()) break; }
     }
 }
 static int stop_release(void) {
@@ -251,7 +257,7 @@ static void advance_voice(AudioRenderer *r, ServerVoice *v, double out_seconds) 
         if (v->offset < length) break;
         if (b->loop && (b->loop_count < 0 || v->loops_done < b->loop_count)) { v->loops_done++; v->offset = b->loop_start > b->start && b->loop_start < b->end ? (uint64_t)(b->loop_start - b->start) : 0; continue; }
         v->valid[v->index] = 0; v->consumed++; v->offset = 0; v->loops_done = 0; v->index = (v->index + 1) & 3;
-        if (b->end_of_stream) { v->played = 0; break; }
+        if (b->end_of_stream) { v->played = 0; if (audio_eos_stops()) break; }
         skip_empty(r, v);
     }
 }
