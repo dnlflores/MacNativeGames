@@ -2452,11 +2452,11 @@ static void wb_ent_free(wb_ent *e) { if (!e) return; if (e->obj) { defer_obj_rel
    tint. Their renderings (wb_note) are listed here and written back when the CPU maps their pool (mtl_pool_map), as
    an invalidate of the whole texture would. TOTK_MAP_WRITEBACK=0 turns it off (A/B). */
 typedef struct { uint64_t serial; const uint8_t *lo, *hi; } wb_lin;
-static wb_lin g_wb_lin[64]; static _Atomic int g_wb_nlin;   // g_smu
+static wb_lin g_wb_lin[256]; static _Atomic int g_wb_nlin;   // g_smu
 static void wb_linear_add(const tex_t *t) {
     int n = atomic_load(&g_wb_nlin);
     for (int i = 0; i < n; i++) if (g_wb_lin[i].serial == t->serial) return;
-    if (n == 64) { static int said; if (!said++) MLOG("[writeback] more than 64 linear renderings wait for write-back: the oldest is left to an invalidate"); memmove(g_wb_lin, g_wb_lin + 1, 63 * sizeof *g_wb_lin); n = 63; }
+    if (n == 256) { static int said; if (!said++) MLOG("[writeback] more than 256 linear renderings wait for write-back: the oldest is left to an invalidate"); memmove(g_wb_lin, g_wb_lin + 1, 255 * sizeof *g_wb_lin); n = 255; }
     g_wb_lin[n] = (wb_lin){t->serial, t->mem, t->mem + t->L.size}; atomic_store(&g_wb_nlin, n + 1);
 }
 static void wb_note(const tex_t *t) {
@@ -2535,7 +2535,7 @@ void mtl_pool_map(const pool_t *p) {
     static int on = -1; if (on < 0) { const char *e = getenv("TOTK_MAP_WRITEBACK"); on = !(e && !strcmp(e, "0")); }
     if (!on || !p || !p->mem || !atomic_load(&g_wb_nlin) || !atomic_load(&g_wb_on)) return;
     const uint8_t *a = p->mem, *z = a + p->size;
-    wb_ent *list[64]; int nl = 0;
+    wb_ent *list[256]; int nl = 0;
     pthread_mutex_lock(&g_smu);
     int n = atomic_load(&g_wb_nlin), keep = 0;
     for (int i = 0; i < n; i++) {
@@ -4269,6 +4269,39 @@ static id<MTLTexture> g_nt_watch; static void *g_nt_watch_ptr; static uint64_t g
 static void nt_watch_after_pass(void);
 static uint8_t g_nt_pass_clear[8]; static MTLClearColor g_nt_pass_cc[8]; static unsigned g_nt_pass_draws;   /* TOTK_NAN_TRACE watch log: how the current pass began */
 static const char *nan_trace_prefix(void);
+/* Linear render targets in CPU-visible pools are what the game reads back with the CPU: BotW's water tiles of the terrain
+   (64x64, one area after another in the same memory), the water colour of each water type (1x1), Magnesis picking. On
+   hardware the GPU writes their memory; the game may invalidate the CPU cache before it even submits the rendering and
+   read later (the water tiles), so a write-back at the invalidate (wb_note) found the previous rendering: the CPU saw
+   the previous area's water, Link walked on lake beds and the water surface went missing (Dueling Peaks). The rendered
+   pixels are copied into the texture's memory on the GPU right after the pass, as the hardware does, when the Metal
+   texture holds the NVN bytes unchanged (single level and layer, same pixel format); others keep wb_note.
+   TOTK_LINEAR_RT_COPY=0 turns it off (A/B). */
+typedef struct { __unsafe_unretained id<MTLTexture> tex; __unsafe_unretained id<MTLBuffer> buf; uint64_t off; uint32_t w, h, pitch; } lin_out;
+static lin_out g_lin_out[8]; static int g_nlin_out;
+static int lin_out_note(const tex_t *t, const view_t *v, int has_v) {
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_LINEAR_RT_COPY"); on = !(e && !strcmp(e, "0")); }
+    if (!on || !nvn_tex_is_linear(&t->d) || g_nlin_out == 8 || t->d.target != 1 || t->d.levels > 1 || t->d.samples > 1 || t->L.layers > 1) return 0;
+    if (has_v && ((v->set_levels && v->base_level) || (v->set_layers && v->min_layer))) return 0;
+    uint32_t pf = 0, upf; int ubpp; uint8_t swz[4];
+    if (bc_unpack(t->d.format, &upf, &ubpp) || !nvn_fmt_to_mtl(t->d.format, &pf, swz)) return 0;
+    id<MTLTexture> mt = tex_mtl(t); void *mb; uint64_t mo;
+    uint32_t pitch = nvn_tex_linear_stride(&t->d); uint64_t n = (uint64_t)pitch * t->d.height;
+    if (!mt || mt.pixelFormat != pf || mt.width != t->d.width || mt.height != t->d.height || n > t->L.size || !mtl_addr((uint64_t)(uintptr_t)t->mem, n, &mb, &mo)) return 0;
+    g_lin_out[g_nlin_out++] = (lin_out){mt, (__bridge id<MTLBuffer>)mb, mo, t->d.width, t->d.height, pitch};
+    return 1;
+}
+static void lin_out_copy(void) {
+    if (!g_nlin_out) return;
+    id e = blit();
+    for (int i = 0; i < g_nlin_out; i++) {
+        const lin_out *o = &g_lin_out[i];
+        usnap_drop((uint64_t)(uintptr_t)o->buf.contents + o->off, (uint64_t)o->pitch * o->h);   // a GPU write: no uniform copy of these bytes from here on
+        enc_b_copy_texture_buffer(e, o->tex, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(o->w, o->h, 1), o->buf, o->off, o->pitch, (NSUInteger)o->pitch * o->h);
+        BOTW_GPU_COPY_SUPERSEDES((__bridge const void *)o->buf, o->off, (size_t)o->pitch * o->h)
+    }
+    g_nlin_out = 0;
+}
 static void rp_end(void) { if (g_enc) {
     ghost_flush();
     if (enc_label_on() && !g_rs_active) { static uint64_t lf = ~0ull, base; uint64_t f = atomic_load(&g_cur_frame); if (f != lf) { lf = f; base = g_stat_pass - 1; }   // 帧内序号：同一趟每帧同名，表里才能按名归并 | Intra-frame serial: the same pass has the same name every frame, so the table can aggregate by name
@@ -4300,6 +4333,7 @@ static void rp_end(void) { if (g_enc) {
       } }
     nt_watch_after_pass();
     for (int i = 0; i < g_nblk_wb; i++) blk_copy(g_blk_wb[i].aux, 1, g_blk_wb[i].dst, &g_blk_wb[i]);   // TOTK: block-render results into the compressed texture
+    lin_out_copy();
     g_nblk_wb = 0; g_rt_range_active = g_rt_range_pending = 0; pg_end_render(); ts_after(); if (g_lp.count) lp_finish(); fz_end();
 #ifdef NVN_RT_RANGE_TEST
     rr_finish(ranged);
@@ -4503,7 +4537,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
         if (!R.rt.color[i] || (clear_only == 1 && !R.clear_c[i])) continue; BOTW_RT_DUP_SKIP(i)
         attach(pd.colorAttachments[i], R.rt.color[i], &R.rt.cview[i], R.rt.has_cview[i]);
         { const tex_t *ot = R.rt.color[i]; BOTW_TEX_FOLLOW(ot) int was = gpu_owned(ot->serial); gpu_owned_mark(ot->serial);
-          if (ot->mem && tex_mirrored(ot)) wb_note(ot);
+          if (ot->mem && tex_mirrored(ot) && !lin_out_note(ot, &R.rt.cview[i], R.rt.has_cview[i])) wb_note(ot);
           static int ownlog = -1; if (ownlog < 0) ownlog = getenv("DM_NVN_OWNLOG") != NULL;
           if (ownlog && !was && tex_mirrored(ot)) MLOG("[ownlog] ser=%llu %ux%ux%u lv%u nvnfmt=%#x flags=%#x pool=%p pflags=%#x mem=%p off=%lld: GPU-rendered texture in a CPU-visible pool", (unsigned long long)ot->serial,
               ot->d.width, ot->d.height, ot->d.depth, ot->d.levels, ot->d.format, ot->d.flags, (void *)ot->pool, ot->pool ? ot->pool->flags : 0, (void *)ot->mem, (long long)ot->off); }
