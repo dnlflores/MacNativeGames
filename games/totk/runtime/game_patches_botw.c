@@ -738,3 +738,54 @@ float runtime_aspect_now(void) {
     uint32_t bits = atomic_load(botw_aspect_slot); float ratio; memcpy(&ratio, &bits, 4); return ratio;
 }
 int runtime_aspect_toggle(void) { return 0; }
+
+/* Cheats chosen on the iOS start screen (launcher.m: never saved, so every launch starts with them off) or set in the
+   environment: TOTK_CHEAT_HEALTH, TOTK_CHEAT_STAMINA, TOTK_CHEAT_RUPEES, TOTK_CHEAT_ARROWS = 1. Applied at every
+   present like a cheat engine: the pointer chains of the community codes for BotW 1.6.0 (build 8e9978d50bdd20b4,
+   github.com/blawar/switchcheats). Every pointer is read with vm_read, so a chain that does not exist yet (title
+   screen, loading) writes nothing. Health and stamina refill to the player's own maximum (the codes wrote 30 hearts
+   and three stamina wheels whatever the save had); rupees and arrows are set to 999999 / 999 and stay in a save made
+   while the cheat is on, as on the console. TOTK_CHEAT_LOG=1 logs the values every 300 frames. */
+#include <mach/mach.h>
+uint8_t *runtime_module_base(const char *name);
+static int cheat_read(uint64_t a, void *out, size_t n) {
+    vm_size_t got = 0;
+    return a > 0x10000 && vm_read_overwrite(mach_task_self(), (vm_address_t)a, n, (vm_address_t)out, &got) == KERN_SUCCESS && got == n;
+}
+/* [main + base], then [p + chain[i]] for each link, then + add: the field's address, 0 when the chain is broken. */
+static uint64_t cheat_chain(const uint8_t *main, uint64_t base, const uint32_t *chain, int n, uint32_t add) {
+    uint64_t p;
+    if (!cheat_read((uint64_t)(uintptr_t)(main + base), &p, 8)) return 0;
+    for (int i = 0; i < n; i++) if (!p || !cheat_read(p + chain[i], &p, 8)) return 0;
+    uint32_t probe;
+    return p && cheat_read(p + add, &probe, 4) ? p + add : 0;
+}
+static int cheat_on(const char *name) { const char *e = getenv(name); return e && *e && strcmp(e, "0"); }
+void botw_cheats_tick(uint64_t frame) {
+    static int health = -1, stamina, rupees, arrows, logging;
+    if (health < 0) {
+        health = cheat_on("TOTK_CHEAT_HEALTH"); stamina = cheat_on("TOTK_CHEAT_STAMINA"); rupees = cheat_on("TOTK_CHEAT_RUPEES");
+        arrows = cheat_on("TOTK_CHEAT_ARROWS"); logging = cheat_on("TOTK_CHEAT_LOG");
+        if (health || stamina || rupees || arrows)
+            fprintf(stderr, "[cheats] on:%s%s%s%s\n", health ? " infinite health" : "", stamina ? " infinite stamina" : "", rupees ? " max rupees" : "", arrows ? " 999 arrows" : "");
+    }
+    if (!(health || stamina || rupees || arrows || logging)) return;
+    const uint8_t *main = runtime_module_base("main"); if (!main) return;
+    static const uint32_t c80[] = {0x80}, c38[] = {0x38}, crupee[] = {0xe40, 0x5b08}, carrow[] = {0x447e8};
+    uint64_t hp = cheat_chain(main, 0x2ca1a78, c80, 1, 0x848);      // current health, quarter hearts (one byte)
+    uint64_t player = cheat_chain(main, 0x2c9fd70, c38, 1, 0x2a8);  // +0: heart containers (float, quarter hearts), +4 / +8: stamina
+    uint64_t rp = cheat_chain(main, 0x2cc5fe0, crupee, 2, 0x5d90);  // rupees (s32)
+    uint64_t ar = cheat_chain(main, 0x2ca6d48, carrow, 1, 0x20);    // equipped arrows (s32; the menu shows it after reopening)
+    float maxhp = 0, st[2] = {0, 0}; uint8_t cur = 0; int32_t money = 0, quiver = 0;
+    if (player) { cheat_read(player, &maxhp, 4); cheat_read(player + 4, st, 8); }
+    if (hp) cheat_read(hp, &cur, 1);
+    if (rp) cheat_read(rp, &money, 4);
+    if (ar) cheat_read(ar, &quiver, 4);
+    if (logging && frame % 300 == 0)
+        fprintf(stderr, "[cheats] F%llu health %u/%g stamina %g %g rupees %d arrows %d (chains%s%s%s%s)\n", (unsigned long long)frame, cur, maxhp, st[0], st[1], money, quiver,
+                hp ? " hp" : "", player ? " player" : "", rp ? " rupees" : "", ar ? " arrows" : "");
+    if (health && hp && maxhp >= 4 && maxhp <= 120 && cur < (uint8_t)maxhp) { uint8_t v = (uint8_t)maxhp; memcpy((void *)(uintptr_t)hp, &v, 1); }
+    if (stamina && player && st[1] > 0 && st[1] <= 3000 && st[0] < st[1]) memcpy((void *)(uintptr_t)(player + 4), &st[1], 4);
+    if (rupees && rp && money != 999999) { int32_t v = 999999; memcpy((void *)(uintptr_t)rp, &v, 4); }
+    if (arrows && ar && quiver != 999) { int32_t v = 999; memcpy((void *)(uintptr_t)ar, &v, 4); }
+}

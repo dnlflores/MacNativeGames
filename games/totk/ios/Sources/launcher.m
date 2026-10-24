@@ -309,6 +309,20 @@ static NSString *prepare_mods(void (^progress)(NSString *)) {
     return nil;
 }
 
+// ---------- cheats (Breath of the Wild) ----------
+/* Kept in memory only, never in the user defaults: every launch of the app starts with all cheats off. The game applies
+   them at every frame (runtime/game_patches_botw.c botw_cheats_tick). */
+static NSMutableSet<NSString *> *g_cheats;
+static NSArray<NSArray<NSString *> *> *cheat_options(void) {   // environment variable, title, detail
+    return @[
+        @[@"TOTK_CHEAT_HEALTH", @"Infinite health", @"Hearts refill to full: Link cannot die"],
+        @[@"TOTK_CHEAT_STAMINA", @"Infinite stamina", @"The stamina wheel stays full while climbing, sprinting and swimming"],
+        @[@"TOTK_CHEAT_RUPEES", @"Max rupees", @"999,999 rupees. A save made while it is on keeps them"],
+        @[@"TOTK_CHEAT_ARROWS", @"999 arrows", @"The equipped arrows stay at 999 (the inventory shows it after reopening). A save keeps them"],
+    ];
+}
+static NSMutableSet<NSString *> *cheats(void) { if (!g_cheats) g_cheats = [NSMutableSet set]; return g_cheats; }
+
 // ---------- start ----------
 NSString *totk_launcher_prepare(void (^progress)(NSString *what)) {
     if (flag(@"autoBackup", YES)) {
@@ -346,6 +360,8 @@ NSString *totk_launcher_apply(void) {
         setenv("TOTK_CONTROLS", controls_path().fileSystemRepresentation, 0);
     }
     if (g_mods_active) setenv("TOTK_ROMFS_MODS", mods_active_dir().fileSystemRepresentation, 0);
+    if (kBotW) for (NSString *c in cheats()) setenv(c.UTF8String, "1", 0);
+    fprintf(stderr, "[launcher] cheats: %s\n", cheats().count ? [cheats().allObjects componentsJoinedByString:@" "].UTF8String : "none");
     fprintf(stderr, "[launcher] graphics %s, fps counter %d, frame rate %s, frame generation %s, aniso %s, full textures %d, audio %s, controls %s, mods %s\n",
             g.UTF8String, flag(@"fpsCounter", YES), cap.UTF8String, kBotW ? "n/a" : str(@"frameGen", @"off").UTF8String, aniso.UTF8String, flag(@"fullTextures", NO),
             str(@"audioBuffer", @"normal").UTF8String, text ? "custom" : "default", g_mods_active ? "on" : "none");
@@ -659,6 +675,18 @@ static TLForm *enhancements_form(void) {
         return @[tex, snd, reset];
     }];
 }
+static TLForm *cheats_form(void) {
+    return [[TLForm alloc] initWithTitle:@"Cheats" build:^NSArray<TLSection *> *(TLForm *me) {
+        (void)me;
+        TLSection *list = section(nil, @"Cheats turn off every time the app restarts. Health and stamina never change your heart containers or stamina wheels.");
+        for (NSArray<NSString *> *o in cheat_options()) {
+            TLRow *r = row(o[1], o[2]); r.isSwitch = YES; r.on = [cheats() containsObject:o[0]];
+            r.toggled = ^(BOOL on) { if (on) [cheats() addObject:o[0]]; else [cheats() removeObject:o[0]]; };
+            [list.rows addObject:r];
+        }
+        return @[list];
+    }];
+}
 static TLForm *button_form(int physical) {
     return [[TLForm alloc] initWithTitle:@(kPhysicalTitles[physical]) build:^NSArray<TLSection *> *(TLForm *me) {
         uint16_t map[CONTROLLER_BUTTONS]; uint8_t modes[CONTROLLER_BUTTONS]; controls_load(map, modes);
@@ -856,7 +884,7 @@ static UIColor *gold(void) { return [UIColor colorWithRed:0.89 green:0.76 blue:0
         [left.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:40], [left.centerYAnchor constraintEqualToAnchor:g.centerYAnchor],
         [left.widthAnchor constraintEqualToAnchor:g.widthAnchor multiplier:0.38],
         [_menu.leadingAnchor constraintEqualToAnchor:left.trailingAnchor constant:24], [_menu.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-16],
-        [_menu.centerYAnchor constraintEqualToAnchor:g.centerYAnchor], [_menu.heightAnchor constraintEqualToConstant:5 * 68 + 40],
+        [_menu.centerYAnchor constraintEqualToAnchor:g.centerYAnchor], [_menu.heightAnchor constraintEqualToConstant:(kBotW ? 6 : 5) * 68 + 40],
     ]];
     for (NSNotificationName n in @[GCControllerDidConnectNotification, GCControllerDidDisconnectNotification])
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(controllersChanged) name:n object:nil];
@@ -874,13 +902,16 @@ static UIColor *gold(void) { return [UIColor colorWithRed:0.89 green:0.76 blue:0
     NSUInteger mods = 0; NSSet *on = enabled_mods(); for (NSString *m in installed_mods()) mods += [on containsObject:m];
     NSUInteger slots = 0; NSDate *latest = nil; save_stats(save_dir(), &slots, &latest);
     int enh = enhancements_changed();
-    return @[
+    NSArray *base = @[
         @[@"display", @"Graphics", option_title(resolution_options(), graphics_choice())],
         @[@"sparkles", @"Enhancements", enh ? [NSString stringWithFormat:@"%d changed", enh] : @"Default"],
         @[@"gamecontroller", @"Controls", changed ? [NSString stringWithFormat:@"Custom layout · %d button%@ changed", changed, changed == 1 ? @"" : @"s"] : @"Default layout"],
         @[@"puzzlepiece.extension", @"Mods", mods ? [NSString stringWithFormat:@"%lu on", (unsigned long)mods] : (installed_mods().count ? @"All off" : @"None installed")],
         @[@"externaldrive", @"Saves", slots ? [NSString stringWithFormat:@"%lu slot%@ · saved %@", (unsigned long)slots, slots == 1 ? @"" : @"s", ago(latest)] : @"No saves yet"],
     ];
+    if (!kBotW) return base;
+    NSUInteger nc = cheats().count;
+    return [base arrayByAddingObject:@[@"wand.and.stars", @"Cheats", nc ? [NSString stringWithFormat:@"%lu on · off after a restart", (unsigned long)nc] : @"All off"]];
 }
 - (void)refresh {
     NSArray *it = [self items];
@@ -890,7 +921,7 @@ static UIColor *gold(void) { return [UIColor colorWithRed:0.89 green:0.76 blue:0
     if (!_starting) _hint.text = pad ? @"Press A on your controller to play. Changes apply when the game starts." : @"Connect a controller to play. Changes apply when the game starts.";
     [_menu reloadData];
 }
-- (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s { return 5; }
+- (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s { return kBotW ? 6 : 5; }
 - (UITableViewCell *)tableView:(UITableView *)t cellForRowAtIndexPath:(NSIndexPath *)ip {
     NSArray *it = [self items][ip.row];
     UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
@@ -905,7 +936,7 @@ static UIColor *gold(void) { return [UIColor colorWithRed:0.89 green:0.76 blue:0
 - (void)tableView:(UITableView *)t didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [t deselectRowAtIndexPath:ip animated:YES];
     if (_starting) return;
-    TLForm *f = ip.row == 0 ? graphics_form() : ip.row == 1 ? enhancements_form() : ip.row == 2 ? controls_form() : ip.row == 3 ? mods_form() : saves_form();
+    TLForm *f = ip.row == 0 ? graphics_form() : ip.row == 1 ? enhancements_form() : ip.row == 2 ? controls_form() : ip.row == 3 ? mods_form() : ip.row == 4 ? saves_form() : cheats_form();
     f.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
         (void)a; [self dismissViewControllerAnimated:YES completion:^{ [self refresh]; }]; }] menu:nil];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:f];
