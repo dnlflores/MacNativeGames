@@ -1,4 +1,7 @@
-/* Text entry for the game (nn::swkbd::ShowKeyboard) with the Mac keyboard.
+/* Text entry for the game (nn::swkbd::ShowKeyboard) with the Mac keyboard, or on iOS the system on-screen keyboard
+   (runtime/frontend_ios.m: an alert with a text field; before 2026-10-24 iOS cancelled every request, and BotW asked
+   again forever when naming a horse). BotW 1.6.0's SDK 7 uses the same layout (sdk+0x3802f0 SetInitialText: offset at
+   +0x3c0, length at +0x3c4, work buffer at +0x4d0; sdk+0x37ef30 MakePresetUserName clears 0x4d0 bytes).
 
    On the Switch the call starts the software-keyboard library applet, which takes the screen until the player confirms
    or cancels. Here the player types on the Mac keyboard in a bar inside the game window (runtime_front_text_input in
@@ -136,14 +139,11 @@ static unsigned show_keyboard(void *out_string, const void *arg_ptr) {
         confirmed = strcmp(forced, "<cancel>") != 0;
         snprintf(text, sizeof text, "%s", strcmp(forced, "<initial>") ? forced : initial);
     } else {
-#if TARGET_OS_OSX
+        /* the Mac: a bar in the game window (frontend.m); iOS: a system prompt with the on-screen keyboard (frontend_ios.m) */
         RuntimeTextRequest req = { prompt, initial, max_len, min_len, password != 0, type == KB_TYPE_NUMPAD, disabled };
         int away = runtime_core_away();   /* the other guest threads keep running while the player types */
         confirmed = runtime_front_text_input(&req, text, sizeof text);
         runtime_core_back(&away);
-#else
-        fprintf(stderr, "[totk] keyboard: text entry is not available on this platform; cancelled\n");
-#endif
     }
     uint16_t u[KB_LIMIT * 2];
     size_t n = confirmed ? clean(u, utf8_to_utf16(text, u, KB_LIMIT * 2), (size_t)max_len, disabled, type == KB_TYPE_NUMPAD) : 0;

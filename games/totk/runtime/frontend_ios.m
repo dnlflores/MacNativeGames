@@ -79,7 +79,73 @@ static void app_active_changed(int active){
  fprintf(stderr,"[totk] app %s\n",active?"became active":"resigned active: GPU submission paused");
 }
 void runtime_front_request_close(void){fprintf(stderr,"[totk] close requested; iOS apps are closed by the user\n");}
-void runtime_front_text_test(const char *op,const char *text){(void)text;fprintf(stderr,"[totk] text entry test \"%s\" ignored: iOS has no text entry bar (the keyboard request is cancelled)\n",op?op:"");}
+static __weak UIView *hostView;
+/* Text entry (nn::swkbd::ShowKeyboard, runtime/swkbd_host.c): a system prompt with the iPadOS / iOS keyboard. The text
+   field keeps the request's limits (length in UTF-16 units, digits only, the disabled keys of swkbd_host.c's allowed()). */
+@interface TOTKTextLimits:NSObject<UITextFieldDelegate>
+@property int maxUnits,minUnits,digitsOnly;@property uint32_t disabled;@property(weak) UIAlertAction *ok;
+@end
+@implementation TOTKTextLimits
+-(BOOL)allowed:(unichar)c{
+ BOOL digit=c>='0'&&c<='9';
+ if(self.digitsOnly&&!digit)return NO;
+ if(c<0x20||c==0x7f)return NO;
+ uint32_t d=self.disabled;
+ if((d&1u<<1&&c==' ')||(d&1u<<2&&c=='@')||(d&1u<<3&&c=='%')||(d&1u<<4&&c=='/')||(d&1u<<5&&c=='\\')||(d&1u<<6&&digit))return NO;
+ return YES;
+}
+-(BOOL)textField:(UITextField *)f shouldChangeCharactersInRange:(NSRange)r replacementString:(NSString *)s{
+ for(NSUInteger i=0;i<s.length;i++){unichar c=[s characterAtIndex:i];if(!(c>=0xd800&&c<0xe000)&&![self allowed:c])return NO;}
+ if(self.maxUnits>0&&f.text.length-r.length+s.length>(NSUInteger)self.maxUnits&&!f.markedTextRange)return NO;
+ return YES;
+}
+-(void)changed:(UITextField *)f{
+ if(f.markedTextRange)return;   /* still composing (Japanese, Chinese input) */
+ if(self.maxUnits>0&&f.text.length>(NSUInteger)self.maxUnits){NSRange k=[f.text rangeOfComposedCharacterSequencesForRange:NSMakeRange(0,(NSUInteger)self.maxUnits)];
+  if(NSMaxRange(k)>(NSUInteger)self.maxUnits)k.length=[f.text rangeOfComposedCharacterSequenceAtIndex:(NSUInteger)self.maxUnits-1].location;f.text=[f.text substringWithRange:k];}
+ self.ok.enabled=f.text.length>0&&(NSInteger)f.text.length>=self.minUnits;
+}
+-(BOOL)textFieldShouldReturn:(UITextField *)f{(void)f;return self.ok.enabled;}
+@end
+static UIViewController *top_controller(void){
+ UIViewController *vc=hostView.window.rootViewController;
+ while(vc.presentedViewController&&!vc.presentedViewController.isBeingDismissed)vc=vc.presentedViewController;
+ return vc;
+}
+int runtime_front_text_input(const RuntimeTextRequest *req,char *out,size_t out_size){
+ if(!req||!out||!out_size)return 0;
+ NSString *prompt=[NSString stringWithUTF8String:req->prompt?req->prompt:""]?:@"",*initial=[NSString stringWithUTF8String:req->initial?req->initial:""]?:@"";
+ int maxU=req->max_units,minU=req->min_units,digits=req->digits_only,secure=req->secure;uint32_t dis=req->disabled;
+ __block NSString *result=nil;dispatch_semaphore_t sem=dispatch_semaphore_create(0);
+ dispatch_async(dispatch_get_main_queue(), ^{
+  UIViewController *vc=top_controller();
+  if(!vc){fprintf(stderr,"[totk] keyboard: no view to show text entry on; cancelled\n");dispatch_semaphore_signal(sem);return;}
+  NSString *limit=maxU>0?[NSString stringWithFormat:@(TOTK_UI("最多 %d 个字","Up to %d characters")),maxU]:nil;
+  UIAlertController *a=[UIAlertController alertControllerWithTitle:prompt message:limit preferredStyle:UIAlertControllerStyleAlert];
+  TOTKTextLimits *lim=[TOTKTextLimits new];lim.maxUnits=maxU;lim.minUnits=minU;lim.digitsOnly=digits;lim.disabled=dis;
+  __weak UIAlertController *wa=a;
+  UIAlertAction *ok=[UIAlertAction actionWithTitle:@(TOTK_UI("确定","OK")) style:UIAlertActionStyleDefault handler:^(UIAlertAction *x){(void)x;
+   (void)lim;result=[wa.textFields.firstObject.text copy]?:@"";dispatch_semaphore_signal(sem);}];
+  UIAlertAction *cancel=[UIAlertAction actionWithTitle:@(TOTK_UI("取消","Cancel")) style:UIAlertActionStyleCancel handler:^(UIAlertAction *x){(void)x;dispatch_semaphore_signal(sem);}];
+  [a addTextFieldWithConfigurationHandler:^(UITextField *f){
+   f.text=initial;f.secureTextEntry=secure!=0;f.delegate=lim;f.clearButtonMode=UITextFieldViewModeWhileEditing;
+   f.keyboardType=digits?UIKeyboardTypeNumberPad:UIKeyboardTypeDefault;f.returnKeyType=UIReturnKeyDone;
+   f.autocorrectionType=UITextAutocorrectionTypeNo;f.autocapitalizationType=UITextAutocapitalizationTypeWords;
+   [f addTarget:lim action:@selector(changed:) forControlEvents:UIControlEventEditingChanged];
+  }];
+  [a addAction:cancel];[a addAction:ok];a.preferredAction=ok;lim.ok=ok;
+  ok.enabled=initial.length>0&&(NSInteger)initial.length>=minU;
+  runtime_input_clear();
+  [vc presentViewController:a animated:YES completion:nil];
+  fprintf(stderr,"[totk] keyboard: text entry shown (%s)\n",prompt.UTF8String);
+ });
+ dispatch_semaphore_wait(sem,DISPATCH_TIME_FOREVER);
+ runtime_input_clear();   /* the A / B press that closed the prompt is not the game's */
+ if(!result)return 0;
+ snprintf(out,out_size,"%s",result.UTF8String?result.UTF8String:"");
+ return 1;
+}
+void runtime_front_text_test(const char *op,const char *text){(void)text;fprintf(stderr,"[totk] text entry test \"%s\" ignored on iOS (type in the system prompt)\n",op?op:"");}
 
 @interface TOTKVsync:NSObject
 @end
@@ -90,7 +156,7 @@ static TOTKVsync *vsyncTarget;
 
 /* Called on the main thread by the app before the game thread starts. */
 void runtime_ios_attach_layer(CAMetalLayer *layer,UIView *host){
- bootStartNS=runtime_now_ns();
+ bootStartNS=runtime_now_ns();hostView=host;
  metalLayer=layer;metalLayer.device=MTLCreateSystemDefaultDevice();metalLayer.pixelFormat=MTLPixelFormatBGRA8Unorm;metalLayer.framebufferOnly=NO;
  CGFloat s=host.window.screen.nativeScale>0?host.window.screen.nativeScale:UIScreen.mainScreen.nativeScale;
  metalLayer.contentsScale=s;
