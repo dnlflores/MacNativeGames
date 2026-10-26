@@ -34,9 +34,55 @@ static Vol vols[AOC_MAX] = {
     {1, AOC1_IMAGE_SIZE, AOC1_IMAGE_SHA256, AOC1_INDEX_SHA256, NULL, 0, 0, 0, -1, "", 0},
     {2, AOC2_IMAGE_SIZE, AOC2_IMAGE_SHA256, AOC2_INDEX_SHA256, NULL, 0, 0, 0, -1, "", 0},
 };
-static struct { uint8_t vol; uint64_t entry; } handles[AOC_NH];   /* entry = file index + 1; 0 is free */
-static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static void need(int c, const char *m) { if (!c) runtime_fail(m); }
+static struct { uint8_t vol; uint64_t entry; uint32_t ovl; int fd; } handles[AOC_NH];   /* entry = file index + 1 (or 1 for an overlay file); 0 is free */
+/* The player's DLC mods (TOTK_AOC_MODS: a folder with a manifest.tsv like romfs.c's TOTK_ROMFS_MODS; the launcher writes it
+   for BCML / UKMM mods that change add-on content files): files of add-on content 1 served from that folder instead,
+   or added. Each line: path, size, SHA-256, and the original's SHA-256 or "*" (replace or add, the original not checked)
+   or "-" (a new file). Every file is hashed at the start; an open that finds another file there stops the game, as in
+   romfs.c. */
+typedef struct { char *name, *path; uint64_t size; dev_t dev; ino_t ino; struct timespec mtime; } AocOverlay;
+static AocOverlay *aoc_ovl; static size_t naoc_ovl;
+static int aoc_ovl_order(const void *a, const void *b) { return strcmp(((const AocOverlay *)a)->name, ((const AocOverlay *)b)->name); }
+static const AocOverlay *aoc_ovl_find(const char *name) {
+    size_t lo = 0, hi = naoc_ovl; while (lo < hi) { size_t m = lo + (hi - lo) / 2; int c = strcmp(aoc_ovl[m].name, name); if (!c) return &aoc_ovl[m]; if (c < 0) lo = m + 1; else hi = m; }
+    return NULL;
+}
+static int aoc_ovl_folder(const char *dir) {   /* dir ends in '/' */
+    size_t n = strlen(dir), lo = 0, hi = naoc_ovl; while (lo < hi) { size_t m = lo + (hi - lo) / 2; if (strcmp(aoc_ovl[m].name, dir) < 0) lo = m + 1; else hi = m; }
+    return lo < naoc_ovl && !strncmp(aoc_ovl[lo].name, dir, n);
+}
+static void sha_file_check(const char *path, uint64_t size, const char *expected) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC); struct stat st;
+    need(fd >= 0 && fstat(fd, &st) == 0 && (uint64_t)st.st_size == size, "DLC mod file missing or wrong size");
+    CC_SHA256_CTX c; CC_SHA256_Init(&c); uint8_t *buf = malloc(8 << 20); need(buf != NULL, "hash buffer"); uint64_t done = 0;
+    for (;;) { ssize_t n = pread(fd, buf, 8 << 20, (off_t)done); need(n >= 0, "DLC mod file read"); if (!n) break; CC_SHA256_Update(&c, buf, (CC_LONG)n); done += (uint64_t)n; }
+    free(buf); close(fd);
+    uint8_t d[32]; CC_SHA256_Final(d, &c); char hex[65]; for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", d[i]);
+    if (strcmp(hex, expected)) { fprintf(stderr, "[botw] DLC mod %s: SHA-256 %s, expected %s\n", path, hex, expected); runtime_fail("DLC mod file changed since its manifest was written"); }
+}
+static void aoc_ovl_load(void) {
+    const char *dir = getenv("TOTK_AOC_MODS"); if (!dir || !*dir || !strcmp(dir, "0")) return;
+    char path[4096]; need(snprintf(path, sizeof path, "%s/manifest.tsv", dir) < (int)sizeof path, "DLC mod path");
+    FILE *m = fopen(path, "r"); if (!m) { fprintf(stderr, "[botw] DLC mods: none (%s)\n", path); return; }
+    char line[8192]; size_t cap = 0;
+    while (fgets(line, sizeof line, m)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        char name[4096], sha[65], orig[65]; unsigned long long size = 0;
+        need(sscanf(line, "%4095[^\t]\t%llu\t%64[0-9a-f]\t%64[0-9a-f*-]", name, &size, sha, orig) == 4 && strlen(sha) == 64, "DLC mod manifest line");
+        need(romfs_path_valid_relative(name), "DLC mod path");
+        char file[8200]; need(snprintf(file, sizeof file, "%s/%s", dir, name) < (int)sizeof file, "DLC mod file path");
+        sha_file_check(file, size, sha);
+        struct stat st; need(stat(file, &st) == 0, "DLC mod file");
+        if (naoc_ovl == cap) { cap = cap ? cap * 2 : 64; aoc_ovl = realloc(aoc_ovl, cap * sizeof *aoc_ovl); need(aoc_ovl != NULL, "DLC mod table"); }
+        aoc_ovl[naoc_ovl++] = (AocOverlay){strdup(name), strdup(file), size, st.st_dev, st.st_ino, st.st_mtimespec};
+    }
+    fclose(m);
+    qsort(aoc_ovl, naoc_ovl, sizeof *aoc_ovl, aoc_ovl_order);
+    for (size_t k = 1; k < naoc_ovl; k++) need(strcmp(aoc_ovl[k - 1].name, aoc_ovl[k].name), "DLC mod manifest names a file twice");
+    fprintf(stderr, "[botw] DLC mods: %zu files from %s checked\n", naoc_ovl, dir);
+}
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int present(const Vol *v) { return (AOC_PRESENT_MASK >> (v->index - 1)) & 1; }
 static void vol_dir(const Vol *v, char *out, size_t cap) {
     const char *dir = getenv("TOTK_AOC");   /* the folder holding <index>/; default beside the game's RomFS */
@@ -99,6 +145,7 @@ static void vol_load(Vol *v) {
     need(snprintf(path, sizeof path, "%s/romfs.bin", dir) < (int)sizeof path, "add-on content image path");
     v->image_fd = open(path, O_RDONLY); need(v->image_fd >= 0, "add-on content image missing");
     verify_image(v, dir);
+    if (v->index == 1) aoc_ovl_load();
     v->loaded = 1;
     fprintf(stderr, "[botw] add-on content %d ready: %llu files, %llu bytes\n", v->index, (unsigned long long)v->file_count, (unsigned long long)v->image_size);
 }
@@ -145,33 +192,48 @@ unsigned runtime_aoc_open(uint64_t *out, const char *path, int mode) {
     const char *p = NULL; Vol *v = vol_of_path(path, &p);
     if (!out || mode != 1) return UNSUPPORTED;
     if (!v || !p) return NOT_FOUND;
-    uint64_t i = lower(v, p); if (i >= v->file_count || strcmp(p, entry_name(v, entry(v, i)))) return NOT_FOUND;
+    const AocOverlay *o = v->index == 1 ? aoc_ovl_find(p) : NULL; int fd = -1; uint64_t i = 0;
+    if (o) {
+        struct stat st; fd = open(o->path, O_RDONLY | O_CLOEXEC);
+        need(fd >= 0 && fstat(fd, &st) == 0 && st.st_dev == o->dev && st.st_ino == o->ino && (uint64_t)st.st_size == o->size &&
+             st.st_mtimespec.tv_sec == o->mtime.tv_sec && st.st_mtimespec.tv_nsec == o->mtime.tv_nsec, "DLC mod file changed after the start check");
+    } else { i = lower(v, p); if (i >= v->file_count || strcmp(p, entry_name(v, entry(v, i)))) return NOT_FOUND; }
     pthread_mutex_lock(&lock);
-    for (unsigned j = 1; j < AOC_NH; j++) if (!handles[j].entry) { handles[j].vol = (uint8_t)(v - vols); handles[j].entry = i + 1; *out = AOC_HANDLE_BASE + j; pthread_mutex_unlock(&lock); return 0; }
+    for (unsigned j = 1; j < AOC_NH; j++) if (!handles[j].entry) {
+        handles[j].vol = (uint8_t)(v - vols); handles[j].entry = o ? 1 : i + 1; handles[j].ovl = o ? (uint32_t)(o - aoc_ovl) + 1 : 0; handles[j].fd = fd;
+        *out = AOC_HANDLE_BASE + j; pthread_mutex_unlock(&lock); return 0; }
     pthread_mutex_unlock(&lock); runtime_fail("add-on content file handle table full"); return INVALID;
 }
 int runtime_aoc_handle(uint64_t h) { return h > AOC_HANDLE_BASE && h < AOC_HANDLE_BASE + AOC_NH; }
-static int handle_entry(uint64_t h, Vol **v, Entry *e) {
+static int handle_entry(uint64_t h, Vol **v, Entry *e, int *fd) {   /* *fd: the overlay file of a DLC mod, else -1 */
     if (!runtime_aoc_handle(h)) return 0;
-    pthread_mutex_lock(&lock); uint64_t i = handles[h - AOC_HANDLE_BASE].entry; uint8_t vi = handles[h - AOC_HANDLE_BASE].vol; pthread_mutex_unlock(&lock);
-    if (!i) return 0; *v = &vols[vi]; *e = entry(*v, i - 1); return 1;
+    pthread_mutex_lock(&lock); uint64_t i = handles[h - AOC_HANDLE_BASE].entry; uint8_t vi = handles[h - AOC_HANDLE_BASE].vol;
+    uint32_t ovl = handles[h - AOC_HANDLE_BASE].ovl; int f = handles[h - AOC_HANDLE_BASE].fd; pthread_mutex_unlock(&lock);
+    if (!i) return 0; *v = &vols[vi];
+    if (ovl) { *e = (Entry){0, aoc_ovl[ovl - 1].size, 0, 0}; if (fd) *fd = f; }
+    else { *e = entry(*v, i - 1); if (fd) *fd = -1; }
+    return 1;
 }
 unsigned runtime_aoc_read(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size) {
-    Vol *v; Entry e; if (!out || offset < 0 || !handle_entry(h, &v, &e)) return INVALID;
+    Vol *v; Entry e; int fd; if (!out || offset < 0 || !handle_entry(h, &v, &e, &fd)) return INVALID;
     if ((uint64_t)offset > e.size || (!buffer && size)) return INVALID;
     uint64_t n = size; if (n > e.size - (uint64_t)offset) n = e.size - (uint64_t)offset; uint64_t done = 0;
     dm_guest_write_prepare(buffer, (size_t)n);
     while (done < n) { size_t chunk = (size_t)(n - done); if (chunk > 8 << 20) chunk = 8 << 20;
-        ssize_t r = pread(v->image_fd, (uint8_t *)buffer + done, chunk, (off_t)(e.offset + (uint64_t)offset + done)); if (r <= 0) runtime_fail("add-on content read failure"); done += (uint64_t)r; }
+        ssize_t r = pread(fd >= 0 ? fd : v->image_fd, (uint8_t *)buffer + done, chunk, (off_t)(e.offset + (uint64_t)offset + done)); if (r <= 0) runtime_fail("add-on content read failure"); done += (uint64_t)r; }
     *out = done; return 0;
 }
-unsigned runtime_aoc_size(int64_t *out, uint64_t h) { Vol *v; Entry e; if (!out || !handle_entry(h, &v, &e)) return INVALID; *out = (int64_t)e.size; return 0; }
-void runtime_aoc_close(uint64_t h) { Vol *v; Entry e; if (!handle_entry(h, &v, &e)) runtime_fail("close invalid add-on content handle"); pthread_mutex_lock(&lock); handles[h - AOC_HANDLE_BASE].entry = 0; pthread_mutex_unlock(&lock); }
+unsigned runtime_aoc_size(int64_t *out, uint64_t h) { Vol *v; Entry e; if (!out || !handle_entry(h, &v, &e, NULL)) return INVALID; *out = (int64_t)e.size; return 0; }
+void runtime_aoc_close(uint64_t h) {
+    Vol *v; Entry e; int fd; if (!handle_entry(h, &v, &e, &fd)) runtime_fail("close invalid add-on content handle");
+    pthread_mutex_lock(&lock); handles[h - AOC_HANDLE_BASE].entry = 0; handles[h - AOC_HANDLE_BASE].ovl = 0; handles[h - AOC_HANDLE_BASE].fd = -1; pthread_mutex_unlock(&lock);
+    if (fd >= 0) close(fd);
+}
 unsigned runtime_aoc_entry_type(int *out, const char *path) {
     const char *p = NULL; Vol *v = vol_of_path(path, &p); if (!out) return INVALID; if (!v || !p) return NOT_FOUND;
-    uint64_t i = lower(v, p); if (i < v->file_count && !strcmp(entry_name(v, entry(v, i)), p)) { *out = 1; return 0; }
+    uint64_t i = lower(v, p); if ((i < v->file_count && !strcmp(entry_name(v, entry(v, i)), p)) || (v->index == 1 && aoc_ovl_find(p))) { *out = 1; return 0; }
     char dir[4096]; if (snprintf(dir, sizeof dir, "%s/", p) >= (int)sizeof dir) return INVALID;
-    i = lower(v, dir); if (i < v->file_count && !strncmp(entry_name(v, entry(v, i)), dir, strlen(dir))) { *out = 0; return 0; }
+    i = lower(v, dir); if ((i < v->file_count && !strncmp(entry_name(v, entry(v, i)), dir, strlen(dir))) || (v->index == 1 && aoc_ovl_folder(dir))) { *out = 0; return 0; }
     return NOT_FOUND;
 }
 #endif

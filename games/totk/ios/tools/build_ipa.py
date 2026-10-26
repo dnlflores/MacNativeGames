@@ -92,6 +92,12 @@ def main():
     (gen/'deps/lib').mkdir(parents=True,exist_ok=True)
     for lib in ('libopus.a','libvpx.a','libtotk_spvc.a'): clone(deps/'lib'/lib,gen/'deps/lib'/lib)
     clone(archive_deps/'ios/lib/libarchive.a',gen/'deps/lib/libarchive.a')
+    # BCML (.bnp) mods: UKMM's converter and merger behind a C interface (tools/ukmm_bridge, GPL-3.0-or-later)
+    if botw:
+        ukmm_deps=tree/'build/ukmm-deps'
+        run([sys.executable,ios/'tools/build_ukmm.py','--out',ukmm_deps],tree,logs/'ios-ukmm.log',env)
+        clone(ukmm_deps/'ios/lib/libtotk_ukmm.a',gen/'deps/lib/libtotk_ukmm.a')
+        shutil.copyfile(ukmm_deps/'ios/totk_ukmm.h',gen/'deps/include/totk_ukmm.h')
     # The in-app shader translator (tools/totk_xlate/publish_ios.sh): checked like the Mac's prebuilt totk_xlate
     xlate=tree/'prebuilt/ios-arm64'
     for line in (xlate/'SHA256SUMS').read_text().splitlines():
@@ -131,7 +137,7 @@ def main():
     env.update(TOTK_APP_NAME=a.app_name,TOTK_BUNDLE_ID=a.bundle_id)
     xcconfig=gen/'totk.xcconfig'
     frameworks=' '.join('-framework '+x for x in ['UIKit','WebKit','Metal','MetalFX','Foundation','QuartzCore','ImageIO','CoreGraphics','CoreText','UniformTypeIdentifiers','CoreFoundation','AudioToolbox','GameController','AVFAudio','Security'])
-    xcconfig.write_text(f'OTHER_LDFLAGS = $(inherited) {frameworks} Gen/deps/lib/libopus.a Gen/deps/lib/libvpx.a Gen/deps/lib/libtotk_xlate.a Gen/deps/lib/libtotk_xlate_boot.o Gen/deps/lib/libtotk_spvc.a Gen/deps/lib/libarchive.a -lc++ -lz -liconv {flags}\n')
+    xcconfig.write_text(f'OTHER_LDFLAGS = $(inherited) {frameworks} Gen/deps/lib/libopus.a Gen/deps/lib/libvpx.a Gen/deps/lib/libtotk_xlate.a Gen/deps/lib/libtotk_xlate_boot.o Gen/deps/lib/libtotk_spvc.a Gen/deps/lib/libarchive.a {"Gen/deps/lib/libtotk_ukmm.a " if botw else ""}-lc++ -lz -liconv {flags}\n')
     run(['xcodegen','generate','--spec','project.generated.yml'],ios,logs/'xcodegen.log',env)
     derived=tree/'build/ios-derived';run(['xcodebuild','-project','TOTKIOS.xcodeproj','-scheme','TOTKIOS','-configuration','Release',
         '-destination','generic/platform=iOS','-derivedDataPath',derived,'CODE_SIGNING_ALLOWED=NO','CODE_SIGNING_REQUIRED=NO','CODE_SIGN_IDENTITY='],

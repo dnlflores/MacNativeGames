@@ -67,12 +67,22 @@ void runtime_shortcut_help_toggle(void) {}
     if (![scene isKindOfClass:UIWindowScene.class]) return;
     self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
     /* The start screen first (launcher.m); Play hands the window to the game. TOTK_SKIP_LAUNCHER=1 (test launches)
-       starts the game at once with the saved options. */
+       starts the game with the saved options once Play's preparation (mods) has run in the background; before that,
+       TOTK_BNP_INSTALL=<file> installs a BCML package. */
     const char *skip = getenv("TOTK_SKIP_LAUNCHER");
     if (skip && !strcmp(skip, "1")) {
-        NSString *err = totk_launcher_apply();
-        if (err) fprintf(stderr, "[launcher] %s\n", err.UTF8String);
-        self.window.rootViewController = [TOTKGameController new];
+        self.window.rootViewController = [UIViewController new];
+        __weak UIWindow *window = self.window;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            const char *gone = getenv("TOTK_MOD_REMOVE"); if (gone && *gone) totk_launcher_remove_mod(@(gone));
+            const char *bnp = getenv("TOTK_BNP_INSTALL"); if (bnp && *bnp) totk_launcher_install_bnp(@(bnp));
+            NSString *prepared = totk_launcher_prepare(^(NSString *what) { fprintf(stderr, "[launcher] %s\n", what.UTF8String); });
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSString *err = prepared ?: totk_launcher_apply();
+                if (err) fprintf(stderr, "[launcher] %s\n", err.UTF8String);
+                window.rootViewController = [TOTKGameController new];
+            });
+        });
     } else {
         TOTKLauncherController *launcher = [TOTKLauncherController new];
         __weak UIWindow *window = self.window;

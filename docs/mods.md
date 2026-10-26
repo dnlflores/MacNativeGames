@@ -51,14 +51,28 @@ the existing manual folder import:
 Limitations:
 
 - Wii U/Cemu mods are not directly compatible with this Switch build.
-- BNP and UKMM packages need to be processed/exported by their mod manager into Switch RomFS
-  files first. Installing these package formats directly is not supported.
+- UKMM packages (`.zip` from UKMM) are not imported directly; BCML packages (`.bnp`) are (below).
 - `exefs`, IPS/pchtxt code patches, cheats, and emulator graphics packs are not loaded by this screen.
-- DLC has a separate reader (`runtime/aoc_romfs.c`) without a player-mod overlay. Mods requiring
-  replacements in DLC title `01007EF00011F001` are not fully supported, even if their base-game
-  files import successfully.
+- RomFS mod folders cannot replace DLC files (title `01007EF00011F001`); BCML packages can.
 - Large overhauls may need merging, resource-size-table changes, or runtime features this port
   does not support. No individual downloaded mod has been tested by this change.
+
+BCML packages (`.bnp`, BotW):
+
+- Download a `.bnp` in the in-app browser, or use **Mods → Import a BCML package (.bnp)…** for a file in Files.
+  UKMM ([U-King Mod Manager](https://github.com/NiceneNerd/ukmm), GPL-3.0-or-later, pinned by
+  `games/totk/ios/tools/build_ukmm.py`) converts it against the app's own game data (`games/totk/tools/ukmm_bridge`).
+  The package becomes an entry in Mods; tap it to choose its options (required groups start on their default
+  or first option).
+- Play merges every enabled package with UKMM's mergers (packs, game data and save flags, actor info, map units,
+  texts, parameter deep merges, the resource size table), in the Mods order, into the lowest layer: RomFS mod folders
+  load above it and replace whole files. The merge is redone only when the packages, their order or options, or the
+  game language change. Text merges use the language the game runs in (US English, or the EU/JP/KR/CN text of the
+  device language, as `runtime/services.c` reports it).
+- DLC files of the merged packages are served by `runtime/aoc_romfs.c` (`TOTK_AOC_MODS`, a manifest like the base
+  game's).
+- Test launches: `TOTK_BNP_INSTALL=<file>` installs a package and `TOTK_MOD_REMOVE=<name>` deletes a mod before
+  `TOTK_SKIP_LAUNCHER=1` starts the game (Play's preparation runs first).
 
 These controls are part of the source build; an older installed app needs rebuilding and reinstalling
 to receive them.

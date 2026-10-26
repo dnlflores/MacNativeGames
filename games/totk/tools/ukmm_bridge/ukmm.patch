@@ -1,0 +1,40 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index c40ea72..b12edf2 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -84,6 +84,7 @@ members = [
+     "crates/uk-reader",
+     "crates/uk-ui",
+     "crates/uk-util",
++    "crates/totk-bridge",
+ 
+ ]
+ 
+diff --git a/crates/uk-manager/src/core.rs b/crates/uk-manager/src/core.rs
+index 046e145..5c0cc47 100644
+--- a/crates/uk-manager/src/core.rs
++++ b/crates/uk-manager/src/core.rs
+@@ -30,6 +30,23 @@ impl Manager {
+         })
+     }
+ 
++    /// A manager over the given settings instead of the settings file (embedders without a config folder).
++    pub fn with_settings(settings: Settings) -> Result<Self> {
++        crate::util::USE_SZ.store(settings.system_7z, std::sync::atomic::Ordering::Release);
++        let settings = Arc::new(RwLock::new(settings));
++        let mod_manager = Arc::new(RwLock::new(
++            mods::Manager::init(&settings).context("Failed to initialize mod manager")?,
++        ));
++        Ok(Self {
++            deploy_manager: Arc::new(RwLock::new(
++                deploy::Manager::init(&settings, &mod_manager)
++                    .context("Failed to initialize deployment manager")?,
++            )),
++            mod_manager,
++            settings,
++        })
++    }
++
+     pub fn reload(&self) -> Result<()> {
+         self.settings.write().reload();
+         *self.mod_manager.write() =

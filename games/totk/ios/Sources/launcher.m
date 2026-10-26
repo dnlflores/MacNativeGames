@@ -4,7 +4,9 @@
    - Enhancements: texture filtering, full-size textures, the audio buffer.
    - Controls: the button layout file (runtime/controller_map.h, Documents/controls.txt -> TOTK_CONTROLS).
    - Mods: RomFS mod folders in Documents/Mods (the Files app shows them), on / off and in order; Play links the enabled
-     ones into one folder with a manifest (runtime/romfs.c, "*" originals) -> TOTK_ROMFS_MODS.
+     ones into one folder with a manifest (runtime/romfs.c, "*" originals) -> TOTK_ROMFS_MODS. Breath of the Wild also
+     takes BCML packages (.bnp): UKMM converts each into a mod folder (tools/ukmm_bridge), and Play merges the enabled ones
+     into the lowest layer, their add-on content files -> TOTK_AOC_MODS (runtime/aoc_romfs.c).
    - Saves: export / import through the Files app, backups (automatic when starting, the last five kept), restore.
    Everything is stored in NSUserDefaults or in Documents and becomes the game's environment when Play is pressed. */
 #import "launcher.h"
@@ -12,6 +14,9 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <WebKit/WebKit.h>
 #import "mod_zip.h"
+#ifdef GAME_BOTW
+#import "totk_ukmm.h"
+#endif
 #include <CommonCrypto/CommonDigest.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -245,8 +250,10 @@ static void set_mod_enabled(NSString *name, BOOL on) {
     [defs() setObject:s.allObjects forKey:@"modsEnabled"];
 }
 /* RomFS-relative path -> file, for one mod (hidden files and a top-level manifest.tsv left out). */
+static BOOL is_ukmm(NSString *name);
 static NSDictionary<NSString *, NSString *> *mod_files(NSString *name) {
     NSString *root = mod_root(name); NSMutableDictionary *files = [NSMutableDictionary dictionary];
+    if (is_ukmm(name)) return files;   // a BCML package: merged at Play (prepare_mods)
     NSDirectoryEnumerator *e = [fm() enumeratorAtPath:root];   // relative paths (see save_stats)
     for (NSString *rel in e) {
         if ([rel.lastPathComponent hasPrefix:@"."]) { if ([e.fileAttributes.fileType isEqualToString:NSFileTypeDirectory]) [e skipDescendants]; continue; }
@@ -264,15 +271,145 @@ static NSString *sha256_file(NSString *path) {
     NSMutableString *hex = [NSMutableString string]; for (int i = 0; i < 32; i++) [hex appendFormat:@"%02x", md[i]];
     return hex;
 }
-static BOOL g_mods_active;
-/* Links the enabled mods' files into one folder (a later mod wins a path) with the manifest the game checks: each file's
-   size and SHA-256, "*" for the original (romfs.c: replaced or added, the packed original not hashed). Reused while
-   nothing changed; hashes are cached by file, size and date. */
+// ---------- BCML packages (.bnp, Breath of the Wild) ----------
+/* A converted package is a mod folder holding mod.zip (UKMM's format) and ukmm.json: the package's metadata (name,
+   version, description, option_groups) and the chosen options ("options": option paths). */
+static NSString *ukmm_info_path(NSString *name) { return [[mods_dir() stringByAppendingPathComponent:name] stringByAppendingPathComponent:@"ukmm.json"]; }
+static BOOL is_ukmm(NSString *name) { return [fm() fileExistsAtPath:ukmm_info_path(name)]; }
+static NSMutableDictionary *ukmm_info(NSString *name) {
+    NSData *d = [NSData dataWithContentsOfFile:ukmm_info_path(name)];
+    id v = d ? [NSJSONSerialization JSONObjectWithData:d options:NSJSONReadingMutableContainers error:nil] : nil;
+    return [v isKindOfClass:NSMutableDictionary.class] ? v : nil;
+}
+static void ukmm_save(NSString *name, NSDictionary *info) {
+    NSData *d = [NSJSONSerialization dataWithJSONObject:info options:NSJSONWritingPrettyPrinted error:nil];
+    [d writeToFile:ukmm_info_path(name) atomically:YES];
+}
+/* The game's text language as UKMM names it, from the code runtime/services.c reports (TOTK_LANG, else the app's
+   preferred language): Breath of the Wild opens Bootup_<this>.pack (EU French / Spanish with the reported USA region). */
+static NSString *ukmm_lang(void) {
+    const char *e = getenv("TOTK_LANG"); NSString *code = e ? @(e) : (NSLocale.preferredLanguages.firstObject ?: @"en-US");
+    NSString *lang = [code componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"-_"]].firstObject.lowercaseString;
+    NSDictionary *map = @{@"ja": @"JPja", @"de": @"EUde", @"fr": @"EUfr", @"es": @"EUes", @"it": @"EUit", @"nl": @"EUnl", @"ru": @"EUru", @"ko": @"KRko", @"zh": @"CNzh"};
+    return map[lang] ?: @"USen";
+}
+static NSString *game_romfs(void) { const char *e = getenv("TOTK_ROMFS"); return e ? @(e) : nil; }
+static NSString *game_aoc(void) { const char *e = getenv("TOTK_AOC"); return e && *e ? [@(e) stringByAppendingPathComponent:@"1"] : nil; }
+/* Each required exclusive group's default (or first) option, and each multiple group's defaults. */
+static NSArray<NSString *> *ukmm_default_options(NSArray *groups) {
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSDictionary *g in groups) {
+        if (![g isKindOfClass:NSDictionary.class]) continue;
+        if ([g[@"type"] isEqual:@"Exclusive"]) {
+            id d = g[@"default"]; NSArray *opts = g[@"options"];
+            if ([d isKindOfClass:NSString.class]) [out addObject:d];
+            else if ([g[@"required"] boolValue] && opts.count) [out addObject:opts[0][@"path"]];
+        } else for (id d in g[@"defaults"]) if ([d isKindOfClass:NSString.class]) [out addObject:d];
+    }
+    return out;
+}
+static NSString *ukmm_summary(NSDictionary *info) {
+    NSUInteger groups = [info[@"option_groups"] count], chosen = [info[@"options"] count];
+    NSString *v = [info[@"version"] length] ? [NSString stringWithFormat:@" %@", info[@"version"]] : @"";
+    return groups ? [NSString stringWithFormat:@"BCML package%@ · %lu option%@ chosen · tap to change", v, (unsigned long)chosen, chosen == 1 ? @"" : @"s"]
+                  : [NSString stringWithFormat:@"BCML package%@", v];
+}
+/* Converts the .bnp at `archive` into a new mod folder; *installed receives its name. Runs off the main thread. */
+static NSString *install_bnp(NSURL *archive, NSString *fallbackName, NSString **installed) {
+#ifdef GAME_BOTW
+    NSString *romfs = game_romfs(); if (!romfs) return @"The game's data was not found.";
+    NSString *stage = [mods_dir() stringByAppendingPathComponent:[@".bnp-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+    NSString *work = [NSTemporaryDirectory() stringByAppendingPathComponent:[@"ukmm-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+    [fm() createDirectoryAtPath:stage withIntermediateDirectories:YES attributes:nil error:nil];
+    char *meta = NULL;
+    char *err = totk_ukmm_convert(archive.fileSystemRepresentation, romfs.fileSystemRepresentation, game_aoc().fileSystemRepresentation,
+                                  work.fileSystemRepresentation, ukmm_lang().UTF8String, [stage stringByAppendingPathComponent:@"mod.zip"].fileSystemRepresentation, &meta);
+    [fm() removeItemAtPath:work error:nil];
+    if (err) { NSString *m = [NSString stringWithFormat:@"This BCML package could not be converted: %s", err]; totk_ukmm_free(err); totk_ukmm_free(meta); [fm() removeItemAtPath:stage error:nil]; return m; }
+    NSMutableDictionary *info = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:meta length:strlen(meta)] options:NSJSONReadingMutableContainers error:nil];
+    totk_ukmm_free(meta);
+    if (![info isKindOfClass:NSMutableDictionary.class]) { [fm() removeItemAtPath:stage error:nil]; return @"The converted package has no readable description."; }
+    info[@"options"] = ukmm_default_options(info[@"option_groups"]);
+    NSString *safe = [info[@"name"] length] ? info[@"name"] : (fallbackName.length ? fallbackName : @"BCML mod");
+    safe = [[safe componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/:\\"]] componentsJoinedByString:@"-"];
+    if ([safe hasPrefix:@"."]) safe = [@"Mod " stringByAppendingString:safe];
+    if (safe.length > 80) safe = [safe substringToIndex:80];
+    NSString *name = safe; for (int k = 2; [fm() fileExistsAtPath:[mods_dir() stringByAppendingPathComponent:name]]; k++) name = [NSString stringWithFormat:@"%@ (%d)", safe, k];
+    NSData *d = [NSJSONSerialization dataWithJSONObject:info options:NSJSONWritingPrettyPrinted error:nil];
+    [d writeToFile:[stage stringByAppendingPathComponent:@"ukmm.json"] atomically:YES];
+    NSError *e = nil;
+    if (![fm() moveItemAtPath:stage toPath:[mods_dir() stringByAppendingPathComponent:name] error:&e]) { [fm() removeItemAtPath:stage error:nil]; return e.localizedDescription; }
+    *installed = name; return nil;
+#else
+    (void)archive; (void)fallbackName; (void)installed; return @"BCML packages are Breath of the Wild mods.";
+#endif
+}
+static BOOL is_7z(NSURL *url) {
+    FILE *f = fopen(url.fileSystemRepresentation, "rb"); uint8_t m[6] = {0}; size_t n = f ? fread(m, 1, 6, f) : 0; if (f) fclose(f);
+    return n == 6 && !memcmp(m, "7z\xbc\xaf\x27\x1c", 6);
+}
+/* Merges the enabled BCML packages (in the mod order) into Documents/.ukmm-merged when they, their options or the
+   language changed; *base / *aoc receive the merged base-game and add-on content folders (nil: none). */
+static NSString *merge_ukmm(NSSet *on, void (^progress)(NSString *), NSString **base, NSString **aoc) {
+    *base = *aoc = nil;
+    NSMutableArray *list = [NSMutableArray array]; NSMutableString *sig = [NSMutableString stringWithFormat:@"%@\n", ukmm_lang()];
+    for (NSString *name in installed_mods()) {
+        if (![on containsObject:name] || !is_ukmm(name)) continue;
+        NSString *zip = [[mods_dir() stringByAppendingPathComponent:name] stringByAppendingPathComponent:@"mod.zip"];
+        NSArray *opts = ukmm_info(name)[@"options"] ?: @[]; NSDictionary *a = [fm() attributesOfItemAtPath:zip error:nil];
+        if (!a) return [NSString stringWithFormat:@"The BCML package %@ is missing its converted files. Delete it and install it again.", name];
+        [list addObject:@{@"path": zip, @"options": opts}];
+        [sig appendFormat:@"%@\t%llu\t%f\t%@\n", zip, a.fileSize, a.fileModificationDate.timeIntervalSince1970, [opts componentsJoinedByString:@"|"]];
+    }
+    NSString *out = [docs() stringByAppendingPathComponent:@".ukmm-merged"], *sigPath = [docs() stringByAppendingPathComponent:@".ukmm-merged.signature"];
+    if (!list.count) { [fm() removeItemAtPath:out error:nil]; [fm() removeItemAtPath:sigPath error:nil]; return nil; }
+#ifdef GAME_BOTW
+    if (![[NSString stringWithContentsOfFile:sigPath encoding:NSUTF8StringEncoding error:nil] isEqualToString:sig]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ progress([NSString stringWithFormat:@"Merging %lu BCML package%@", (unsigned long)list.count, list.count == 1 ? @"" : @"s"]); });
+        [fm() removeItemAtPath:sigPath error:nil];
+        NSString *json = [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:list options:0 error:nil] encoding:NSUTF8StringEncoding];
+        char *err = totk_ukmm_merge(json.UTF8String, game_romfs().fileSystemRepresentation, game_aoc().fileSystemRepresentation, ukmm_lang().UTF8String, out.fileSystemRepresentation);
+        if (err) { NSString *m = [NSString stringWithFormat:@"The BCML packages could not be merged: %s", err]; totk_ukmm_free(err); return m; }
+        [sig writeToFile:sigPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+#endif
+    NSString *b = [out stringByAppendingPathComponent:@"01007EF00011E000/romfs"], *c = [out stringByAppendingPathComponent:@"01007EF00011F001/romfs"];
+    if (is_dir(b)) *base = b;
+    if (is_dir(c)) *aoc = c;
+    return nil;
+}
+/* RomFS-relative path -> file under a folder (hidden files and manifest.tsv left out). */
+static NSDictionary<NSString *, NSString *> *folder_files(NSString *root) {
+    NSMutableDictionary *files = [NSMutableDictionary dictionary]; NSDirectoryEnumerator *e = [fm() enumeratorAtPath:root];
+    for (NSString *rel in e) {
+        if ([rel.lastPathComponent hasPrefix:@"."]) { if ([e.fileAttributes.fileType isEqualToString:NSFileTypeDirectory]) [e skipDescendants]; continue; }
+        if (![e.fileAttributes.fileType isEqualToString:NSFileTypeRegular] || [rel isEqualToString:@"manifest.tsv"]) continue;
+        files[rel] = [root stringByAppendingPathComponent:rel];
+    }
+    return files;
+}
+static BOOL g_mods_active, g_aoc_mods_active;
+static NSString *link_layer(NSDictionary<NSString *, NSString *> *pick, NSString *active, NSString *what, void (^progress)(NSString *));
+/* The enabled mods: BCML packages merged first (the lowest layer), then the RomFS mods in order (a later mod wins a
+   path); the add-on content files of the packages go to their own layer (TOTK_AOC_MODS). */
 static NSString *prepare_mods(void (^progress)(NSString *)) {
-    NSString *active = mods_active_dir(); g_mods_active = NO;
+    NSString *active = mods_active_dir(), *aocActive = [docs() stringByAppendingPathComponent:@".mods-active-aoc"]; g_mods_active = g_aoc_mods_active = NO;
     NSSet *on = enabled_mods(); NSMutableDictionary<NSString *, NSString *> *pick = [NSMutableDictionary dictionary];
+    NSString *mergedBase = nil, *mergedAoc = nil, *error = merge_ukmm(on, progress, &mergedBase, &mergedAoc);
+    if (error) return error;
+    if (mergedBase) [pick addEntriesFromDictionary:folder_files(mergedBase)];
     for (NSString *name in installed_mods()) if ([on containsObject:name]) [pick addEntriesFromDictionary:mod_files(name)];
+    NSDictionary *aocPick = mergedAoc ? folder_files(mergedAoc) : @{};
+    if (aocPick.count) { if ((error = link_layer(aocPick, aocActive, @"add-on content", progress))) return error; g_aoc_mods_active = YES; }
+    else [fm() removeItemAtPath:aocActive error:nil];
     if (!pick.count) { [fm() removeItemAtPath:active error:nil]; return nil; }
+    if ((error = link_layer(pick, active, @"mods", progress))) return error;
+    g_mods_active = YES; return nil;
+}
+/* Links the files into one folder with the manifest the game checks: each file's size and SHA-256, "*" for the original
+   (romfs.c / aoc_romfs.c: replaced or added, the packed original not hashed). Reused while nothing changed; hashes are
+   cached by file, size and date. */
+static NSString *link_layer(NSDictionary<NSString *, NSString *> *pick, NSString *active, NSString *what, void (^progress)(NSString *)) {
     NSArray *paths = [pick.allKeys sortedArrayUsingSelector:@selector(compare:)];
     NSMutableString *sig = [NSMutableString string];
     for (NSString *rel in paths) {
@@ -282,14 +419,14 @@ static NSString *prepare_mods(void (^progress)(NSString *)) {
     }
     NSString *sigPath = [active stringByAppendingPathComponent:@".signature"];
     if ([[NSString stringWithContentsOfFile:sigPath encoding:NSUTF8StringEncoding error:nil] isEqualToString:sig] &&
-        [fm() fileExistsAtPath:[active stringByAppendingPathComponent:@"manifest.tsv"]]) { g_mods_active = YES; return nil; }
-    NSString *cachePath = [docs() stringByAppendingPathComponent:@".mods-hashes.plist"];
+        [fm() fileExistsAtPath:[active stringByAppendingPathComponent:@"manifest.tsv"]]) return nil;
+    NSString *cachePath = [docs() stringByAppendingPathComponent:[NSString stringWithFormat:@".mods-hashes%@.plist", [active.lastPathComponent hasSuffix:@"-aoc"] ? @"-aoc" : @""]];
     NSMutableDictionary *cache = [NSMutableDictionary dictionaryWithContentsOfFile:cachePath] ?: [NSMutableDictionary dictionary], *used = [NSMutableDictionary dictionary];
     [fm() removeItemAtPath:active error:nil];
     NSMutableString *manifest = [NSMutableString stringWithString:@"# the start screen's enabled mods (launcher.m)\n"];
     NSUInteger i = 0;
     for (NSString *rel in paths) {
-        if (++i % 25 == 1 || i == paths.count) { NSString *m = [NSString stringWithFormat:@"Preparing mods: %lu of %lu files", (unsigned long)i, (unsigned long)paths.count];
+        if (++i % 25 == 1 || i == paths.count) { NSString *m = [NSString stringWithFormat:@"Preparing %@: %lu of %lu files", what, (unsigned long)i, (unsigned long)paths.count];
             dispatch_async(dispatch_get_main_queue(), ^{ progress(m); }); }
         NSString *src = pick[rel], *dst = [active stringByAppendingPathComponent:rel];
         [fm() createDirectoryAtPath:dst.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
@@ -305,7 +442,6 @@ static NSString *prepare_mods(void (^progress)(NSString *)) {
     [used writeToFile:cachePath atomically:YES];
     [manifest writeToFile:[active stringByAppendingPathComponent:@"manifest.tsv"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
     [sig writeToFile:sigPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    g_mods_active = YES;
     return nil;
 }
 
@@ -330,6 +466,17 @@ NSString *totk_launcher_prepare(void (^progress)(NSString *what)) {
         backup_saves(@"Auto");
     }
     return prepare_mods(progress);
+}
+NSString *totk_launcher_install_bnp(NSString *path) {
+    NSString *name = nil, *error = install_bnp([NSURL fileURLWithPath:path], path.lastPathComponent.stringByDeletingPathExtension, &name);
+    if (!error) set_mod_enabled(name, YES);
+    fprintf(stderr, "[launcher] BCML package %s: %s\n", path.lastPathComponent.UTF8String, error ? error.UTF8String : [@"installed as " stringByAppendingString:name].UTF8String);
+    return error;
+}
+void totk_launcher_remove_mod(NSString *name) {
+    if (!name.length || [name containsString:@"/"] || [name hasPrefix:@"."]) return;
+    BOOL removed = [fm() removeItemAtPath:[mods_dir() stringByAppendingPathComponent:name] error:nil]; set_mod_enabled(name, NO);
+    fprintf(stderr, "[launcher] mod %s %s\n", name.UTF8String, removed ? "removed" : "not found");
 }
 NSString *totk_launcher_apply(void) {
     /* Graphics: handheld (default) / docked / docked + MetalFX output / native 1440p or 4K (Breath of the Wild,
@@ -360,6 +507,7 @@ NSString *totk_launcher_apply(void) {
         setenv("TOTK_CONTROLS", controls_path().fileSystemRepresentation, 0);
     }
     if (g_mods_active) setenv("TOTK_ROMFS_MODS", mods_active_dir().fileSystemRepresentation, 0);
+    if (g_aoc_mods_active) setenv("TOTK_AOC_MODS", [docs() stringByAppendingPathComponent:@".mods-active-aoc"].fileSystemRepresentation, 0);
     if (kBotW) for (NSString *c in cheats()) setenv(c.UTF8String, "1", 0);
     fprintf(stderr, "[launcher] cheats: %s\n", cheats().count ? [cheats().allObjects componentsJoinedByString:@" "].UTF8String : "none");
     fprintf(stderr, "[launcher] graphics %s, fps counter %d, frame rate %s, frame generation %s, aniso %s, full textures %d, audio %s, controls %s, mods %s\n",
@@ -507,6 +655,11 @@ static void pick_folder(UIViewController *vc, void (^picked)(NSURL *url)) {
     g_picker = [TLPicker new]; g_picker.picked = picked; p.delegate = g_picker;
     [vc presentViewController:p animated:YES completion:nil];
 }
+static void pick_file(UIViewController *vc, void (^picked)(NSURL *url)) {   // a copy in the app's inbox
+    UIDocumentPickerViewController *p = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData] asCopy:YES];
+    g_picker = [TLPicker new]; g_picker.picked = picked; p.delegate = g_picker;
+    [vc presentViewController:p animated:YES completion:nil];
+}
 static void export_folder(UIViewController *vc, NSURL *url, void (^finished)(void)) {
     UIDocumentPickerViewController *p = [[UIDocumentPickerViewController alloc] initForExportingURLs:@[url] asCopy:YES];
     g_picker = [TLPicker new]; g_picker.picked = ^(NSURL *u) { (void)u; finished(); }; p.delegate = g_picker;
@@ -531,7 +684,8 @@ static NSString *copy_in(NSURL *url, NSString *to, NSString **error) {
 @property(nonatomic, copy) NSString *downloadName;
 @property(nonatomic, strong) NSTimer *timer;
 @property(nonatomic, copy) NSURL *site;
-@property(nonatomic, copy) void (^installed)(void);
+@property(nonatomic, copy) NSString *downloadExtension;
+@property(nonatomic, copy) void (^installed)(NSString *name);
 @end
 @implementation TLModBrowser
 - (void)viewDidLoad {
@@ -559,7 +713,7 @@ static NSString *copy_in(NSURL *url, NSString *to, NSString **error) {
 }
 - (void)webView:(WKWebView *)web decidePolicyForNavigationResponse:(WKNavigationResponse *)response decisionHandler:(void (^)(WKNavigationResponsePolicy))decide {
     NSString *mime = response.response.MIMEType.lowercaseString;
-    BOOL archive = [mime containsString:@"zip"] || [mime containsString:@"rar"] || [mime isEqualToString:@"application/octet-stream"] || !response.canShowMIMEType;
+    BOOL archive = [mime containsString:@"zip"] || [mime containsString:@"rar"] || [mime containsString:@"7z"] || [mime isEqualToString:@"application/octet-stream"] || !response.canShowMIMEType;
     decide(archive ? WKNavigationResponsePolicyDownload : WKNavigationResponsePolicyAllow);
 }
 - (WKWebView *)webView:(WKWebView *)web createWebViewWithConfiguration:(WKWebViewConfiguration *)config forNavigationAction:(WKNavigationAction *)action windowFeatures:(WKWindowFeatures *)features {
@@ -569,10 +723,12 @@ static NSString *copy_in(NSURL *url, NSString *to, NSString **error) {
 - (void)webView:(WKWebView *)web navigationResponse:(WKNavigationResponse *)response didBecomeDownload:(WKDownload *)download { download.delegate = self; }
 - (void)download:(WKDownload *)download decideDestinationUsingResponse:(NSURLResponse *)response suggestedFilename:(NSString *)filename completionHandler:(void (^)(NSURL *))completion {
     if (self.download) { completion(nil); return; }
-    if (response.expectedContentLength > 512LL * 1024 * 1024 || ![@[@"zip", @"rar"] containsObject:filename.pathExtension.lowercaseString]) {
-        completion(nil); alert(self, @"Choose a supported archive", @"Automatic install supports ZIP and RAR files up to 512 MB containing one base-game Switch romfs folder. 7z, BNP and UKMM files need manual export/extraction."); return;
+    NSArray *kinds = kBotW ? @[@"zip", @"rar", @"bnp"] : @[@"zip", @"rar"];
+    if (response.expectedContentLength > 512LL * 1024 * 1024 || ![kinds containsObject:filename.pathExtension.lowercaseString]) {
+        completion(nil); alert(self, @"Choose a supported archive", kBotW ? @"Automatic install supports ZIP and RAR files with one base-game Switch romfs folder, and BCML packages (.bnp), up to 512 MB. 7z and UKMM files need manual extraction."
+                                                                          : @"Automatic install supports ZIP and RAR files up to 512 MB containing one base-game Switch romfs folder. 7z, BNP and UKMM files need manual export/extraction."); return;
     }
-    self.download = download; self.downloadName = filename.lastPathComponent.stringByDeletingPathExtension;
+    self.download = download; self.downloadName = filename.lastPathComponent.stringByDeletingPathExtension; self.downloadExtension = filename.pathExtension.lowercaseString;
     self.archive = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID.UUID.UUIDString stringByAppendingString:@".archive"]]];
     self.modalInPresentation = YES; self.navigationController.modalInPresentation = YES;
     self.title = @"Downloading mod…"; self.navigationItem.leftBarButtonItem.enabled = NO;
@@ -602,7 +758,9 @@ static NSString *copy_in(NSURL *url, NSString *to, NSString **error) {
     NSURL *archive = self.archive; NSString *name = self.downloadName;
     NSString *stage = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
     __block NSString *installedName = nil;
-    busy(self, @"Installing mod", ^NSString *{
+    BOOL bnp = kBotW && ([self.downloadExtension isEqualToString:@"bnp"] || is_7z(archive));
+    busy(self, bnp ? @"Converting BCML package" : @"Installing mod", ^NSString *{
+        if (bnp) { NSString *installed = nil, *error = install_bnp(archive, name, &installed); installedName = installed; return error; }
         NSString *error = totk_extract_mod_archive(archive, stage);
         NSString *root = error ? nil : totk_mod_romfs(stage, kBotW ? @"01007EF00011E000" : @"0100F2C0115B6000", &error);
         if (root) {
@@ -619,8 +777,8 @@ static NSString *copy_in(NSURL *url, NSString *to, NSString **error) {
     }, ^(NSString *error) {
         [self finishDownloadWithError:error];
         if (!error && installedName) {
-            set_mod_enabled(installedName, YES); if (self.installed) self.installed();
-            [self dismissViewControllerAnimated:YES completion:nil];
+            set_mod_enabled(installedName, YES); NSString *n = installedName; void (^done)(NSString *) = self.installed;
+            [self dismissViewControllerAnimated:YES completion:^{ if (done) done(n); }];
         }
     });
 }
@@ -737,6 +895,43 @@ static TLForm *controls_form(void) {
         return @[pre, btn];
     }];
 }
+/* The options of a BCML package: one section per group; an exclusive group is a choice of one (none allowed unless
+   required), a multiple group a switch per option. Saved in its ukmm.json; Play merges with them. */
+static TLForm *ukmm_options_form(NSString *name) {
+    NSDictionary *info0 = ukmm_info(name);
+    return [[TLForm alloc] initWithTitle:info0[@"name"] ?: name build:^NSArray<TLSection *> *(TLForm *me) {
+        NSMutableDictionary *info = ukmm_info(name); NSMutableArray *chosen = [info[@"options"] mutableCopy] ?: [NSMutableArray array];
+        NSMutableArray *sections = [NSMutableArray array];
+        NSString *desc = info[@"description"]; if (desc.length > 600) desc = [[desc substringToIndex:600] stringByAppendingString:@"…"];
+        TLSection *about = section(nil, desc.length ? desc : nil);
+        TLRow *v = row(@"Version", [info[@"version"] length] ? info[@"version"] : @"–"); [about.rows addObject:v]; [sections addObject:about];
+        for (NSDictionary *g in info[@"option_groups"]) {
+            BOOL exclusive = [g[@"type"] isEqual:@"Exclusive"], required = [g[@"required"] boolValue];
+            NSString *header = [[g[@"name"] stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"_[]0123456789/ "]] length] ? g[@"name"] : nil;
+            TLSection *sec = section(header, [g[@"description"] length] ? g[@"description"] : (exclusive ? (required ? @"Choose one." : @"Choose one, or none.") : nil));
+            NSArray *paths = [g[@"options"] valueForKey:@"path"];
+            for (NSDictionary *o in g[@"options"]) {
+                NSString *path = o[@"path"]; TLRow *r = row([o[@"name"] length] ? o[@"name"] : path, [o[@"description"] length] ? o[@"description"] : nil);
+                if (exclusive) {
+                    r.checked = [chosen containsObject:path];
+                    r.tapped = ^{ NSMutableDictionary *i = ukmm_info(name); NSMutableArray *c = [i[@"options"] mutableCopy] ?: [NSMutableArray array];
+                        BOOL was = [c containsObject:path]; [c removeObjectsInArray:paths];
+                        if (!was || required) [c addObject:path];
+                        i[@"options"] = c; ukmm_save(name, i); [me reload]; };
+                } else {
+                    r.isSwitch = YES; r.on = [chosen containsObject:path];
+                    r.toggled = ^(BOOL on) { NSMutableDictionary *i = ukmm_info(name); NSMutableArray *c = [i[@"options"] mutableCopy] ?: [NSMutableArray array];
+                        [c removeObject:path]; if (on) [c addObject:path]; i[@"options"] = c; ukmm_save(name, i); };
+                }
+                [sec.rows addObject:r];
+            }
+            [sections addObject:sec];
+        }
+        [sections.lastObject setFooter:[NSString stringWithFormat:@"%@%@Changes apply the next time you press Play (the packages are merged again then).",
+                                        [sections.lastObject footer] ?: @"", [sections.lastObject footer] ? @"\n\n" : @""]];
+        return sections;
+    }];
+}
 static TLForm *mods_form(void) {
     TLForm *form = [[TLForm alloc] initWithTitle:@"Mods" build:^NSArray<TLSection *> *(TLForm *me) {
         NSArray *mods = installed_mods(); NSSet *on = enabled_mods();
@@ -748,7 +943,10 @@ static TLForm *mods_form(void) {
             NSString *d = [NSString stringWithFormat:@"%lu files · %@", (unsigned long)files.count, [NSByteCountFormatter stringFromByteCount:(long long)bytes countStyle:NSByteCountFormatterCountStyleFile]];
             if (mod_has_exefs(name)) d = [d stringByAppendingString:@" · its exefs (code) part is not supported"];
             if (!files.count) d = @"No RomFS files found (a mod needs a romfs folder or RomFS paths)";
+            NSDictionary *pkg = is_ukmm(name) ? ukmm_info(name) : nil;
+            if (pkg) d = ukmm_summary(pkg);
             TLRow *r = row(name, d); r.isSwitch = YES; r.on = [on containsObject:name];
+            if (pkg) r.tapped = ^{ [me.navigationController pushViewController:ukmm_options_form(name) animated:YES]; };
             r.toggled = ^(BOOL v) { set_mod_enabled(name, v); };
             r.deleted = ^{ [fm() removeItemAtPath:[mods_dir() stringByAppendingPathComponent:name] error:nil]; set_mod_enabled(name, NO); };
             [list.rows addObject:r];
@@ -757,7 +955,8 @@ static TLForm *mods_form(void) {
             NSMutableArray *o = [installed_mods() mutableCopy]; NSString *m = o[(NSUInteger)from];
             [o removeObjectAtIndex:(NSUInteger)from]; [o insertObject:m atIndex:(NSUInteger)to]; [defs() setObject:o forKey:@"modsOrder"];
         };
-        TLSection *act = section(nil, @"RomFS mods only (the mod's romfs folder). Code (exefs) mods do not apply to this port. Changing mods backs up your saves first when automatic backups are on.");
+        TLSection *act = section(nil, kBotW ? @"RomFS mods (the mod's romfs folder) and BCML packages (.bnp, merged together when you press Play; tap one to choose its options). Code (exefs) mods do not apply to this port. Changing mods backs up your saves first when automatic backups are on."
+                                            : @"RomFS mods only (the mod's romfs folder). Code (exefs) mods do not apply to this port. Changing mods backs up your saves first when automatic backups are on.");
         TLRow *imp = row(@"Import a mod folder…", nil); imp.symbol = @"square.and.arrow.down";
         imp.tapped = ^{ pick_folder(me, ^(NSURL *url) {
             NSString *to = [mods_dir() stringByAppendingPathComponent:url.lastPathComponent];
@@ -765,9 +964,24 @@ static TLForm *mods_form(void) {
                  ^(NSString *m) { if (m) alert(me, @"Could not import the mod", m); else set_mod_enabled(url.lastPathComponent, YES); [me reload]; });
         }); };
         [act.rows addObject:imp];
+        if (kBotW) {
+            TLRow *bnp = row(@"Import a BCML package (.bnp)…", nil); bnp.symbol = @"shippingbox";
+            bnp.tapped = ^{ pick_file(me, ^(NSURL *url) {
+                if (![url.pathExtension.lowercaseString isEqualToString:@"bnp"] && !is_7z(url)) { alert(me, @"Choose a .bnp file", @"BCML packages end in .bnp."); return; }
+                __block NSString *installed = nil;
+                busy(me, @"Converting BCML package", ^NSString *{ NSString *n = nil, *err = install_bnp(url, url.lastPathComponent.stringByDeletingPathExtension, &n); installed = n; [fm() removeItemAtURL:url error:nil]; return err; },
+                     ^(NSString *m) {
+                    if (m) { alert(me, @"Could not install the package", m); return; }
+                    set_mod_enabled(installed, YES); [me reload];
+                    if ([ukmm_info(installed)[@"option_groups"] count]) [me.navigationController pushViewController:ukmm_options_form(installed) animated:YES];
+                });
+            }); };
+            [act.rows addObject:bnp];
+        }
         {
             TLSection *browse = section(kBotW ? @"Find Breath of the Wild mods" : @"Find Tears of the Kingdom mods",
-                [NSString stringWithFormat:@"Browse here and tap a ZIP or RAR download to install and enable it automatically. Choose Switch %@ base-game RomFS mods (one romfs folder, up to 512 MB compressed / 2 GB extracted). Nexus may require login and its normal download steps. Other archive formats need manual extraction and folder import.", mod_game_version()]);
+                kBotW ? [NSString stringWithFormat:@"Browse here and tap a ZIP, RAR or BNP download to install and enable it automatically. Choose Switch %@ mods: RomFS archives (one romfs folder, up to 512 MB compressed / 2 GB extracted) or BCML packages. Nexus may require login and its normal download steps. Other archive formats need manual extraction and folder import.", mod_game_version()]
+                      : [NSString stringWithFormat:@"Browse here and tap a ZIP or RAR download to install and enable it automatically. Choose Switch %@ base-game RomFS mods (one romfs folder, up to 512 MB compressed / 2 GB extracted). Nexus may require login and its normal download steps. Other archive formats need manual extraction and folder import.", mod_game_version()]);
             NSArray *sites = kBotW ? @[
                 @[@"Browse GameBanana (Switch)", @"https://gamebanana.com/games/6386"],
                 @[@"Browse Nexus Mods", @"https://www.nexusmods.com/games/legendofzeldabreathofthewild/mods"]
@@ -776,11 +990,14 @@ static TLForm *mods_form(void) {
                 @[@"Browse Nexus Mods", @"https://www.nexusmods.com/games/legendofzeldatearsofthekingdom/mods"]
             ];
             for (NSArray<NSString *> *site in sites) {
-                TLRow *link = row(site[0], @"Browse and install ZIP / RAR downloads"); link.symbol = @"safari";
+                TLRow *link = row(site[0], kBotW ? @"Browse and install ZIP / RAR / BNP downloads" : @"Browse and install ZIP / RAR downloads"); link.symbol = @"safari";
                 NSString *address = site[1];
                 link.tapped = ^{
                     TLModBrowser *browser = [TLModBrowser new]; browser.site = [NSURL URLWithString:address];
-                    browser.installed = ^{ [me reload]; };
+                    browser.installed = ^(NSString *name) {
+                        [me reload];
+                        if (is_ukmm(name) && [ukmm_info(name)[@"option_groups"] count]) [me.navigationController pushViewController:ukmm_options_form(name) animated:YES];
+                    };
                     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:browser];
                     nav.modalPresentationStyle = UIModalPresentationFullScreen;
                     [me presentViewController:nav animated:YES completion:nil];
@@ -788,7 +1005,7 @@ static TLForm *mods_form(void) {
                 [browse.rows addObject:link];
             }
             TLSection *compatibility = section(@"Supported downloads",
-                kBotW ? @"Use extracted Switch RomFS files. Wii U/Cemu packs, BNP/UKMM packages, cheats and exefs code patches cannot be imported directly. Export packages as Switch RomFS with their mod manager first. DLC RomFS replacements are not supported. Mods that change the same file overwrite each other; this screen does not merge their contents. Back up saves before trying a new mod."
+                kBotW ? @"Switch RomFS files and BCML packages (.bnp). BCML packages are merged with UKMM's merger, so several of them can change the same game data (items, flags, text, maps); they may also replace add-on content files. RomFS mods load above them and overwrite whole files. Wii U/Cemu packs, UKMM packages, cheats and exefs code patches cannot be imported. Back up saves before trying a new mod."
                       : @"Use Switch RomFS mods matching the game version shown above. Cheats, exefs code patches and emulator graphics mods are not supported. Mods that change the same file overwrite each other; this screen does not merge their contents. Some UI and heap files are reserved by this port and cannot be replaced by player mods. Back up saves before trying a new mod.");
             return @[list, act, browse, compatibility];
         }

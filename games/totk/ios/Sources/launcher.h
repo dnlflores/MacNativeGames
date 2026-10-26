@@ -14,3 +14,8 @@ NSString *totk_launcher_apply(void);
 /* What Play prepares before the game starts (mods folder, automatic save backup); can take a while for big mods.
    progress is called on the main thread. Returns nil or an error message. */
 NSString *totk_launcher_prepare(void (^progress)(NSString *what));
+/* Converts the BCML package (.bnp) at path into an enabled mod, as the Mods screen does (Breath of the Wild; test
+   launches: TOTK_BNP_INSTALL). Runs off the main thread; returns nil or an error message. */
+NSString *totk_launcher_install_bnp(NSString *path);
+/* Deletes the mod folder Mods/<name> and turns it off (test launches: TOTK_MOD_REMOVE). */
+void totk_launcher_remove_mod(NSString *name);

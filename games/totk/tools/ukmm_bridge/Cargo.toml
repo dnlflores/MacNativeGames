@@ -1,0 +1,33 @@
+[package]
+name = "totk-bridge"
+description = "BCML (.bnp) mod conversion and UKMM merging for the Breath of the Wild port, over the port's own RomFS images"
+edition = "2024"
+license = "GPL-3.0-or-later"
+version = "0.1.0"
+publish = false
+
+[lib]
+name = "totk_ukmm"
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "ukmm-bridge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+dashmap = { workspace = true }
+fs-err = { workspace = true }
+log = { workspace = true }
+parking_lot = { workspace = true }
+roead = { workspace = true }
+rstb = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+smartstring = { workspace = true }
+typetag = { workspace = true }
+uk-content = { path = "../uk-content" }
+uk-localization = { path = "../uk-localization" }
+uk-manager = { path = "../uk-manager" }
+uk-mod = { path = "../uk-mod" }
+uk-reader = { path = "../uk-reader" }
