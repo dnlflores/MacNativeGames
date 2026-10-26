@@ -39,3 +39,17 @@
 - 通过、无收益、未覆盖、负对照失败和被中断的测试分别记录；不为追求分数删掉卡顿或异常。
 
 旧版代表场景 p95≤10 ms 是阶段目标，尚不是全图承诺；1.4.3 须建立自己的基线。单项正确性修复、版本适配和内存改进也应分别交代，不能都称为 FPS 提升。
+
+## BotW on the M4 iPad: 3D render scale (2026-10-26)
+
+The owner's iPad session (native 1440p with Match display: a 2560×1764 canvas, frame cap 115) was GPU-bound: in the
+world GPU p50 13.5 ms rising to 17.5 ms over 25,000 frames (heat), frame p50 about 18.5 ms. The same save and settings
+on the development Mac (M4 Pro, 16-core GPU) take 6.7 ms, so the iPad's 10-core GPU, not port overhead, is the limit.
+A per-pass GPU profile (`TOTK_PASS_GPU=3000:3`) shows no port pass among the costly ones: the largest single pass is the
+game's own FXAA into the full canvas (0.7 of 5.4 ms on the Mac), the rest is the game's 3D rendering.
+
+`TOTK_BOTW_RENDER_SCALE=<percent>` (launcher: Graphics → 3D resolution, default Balanced 75% in docked and native modes)
+draws the 3D scene at that share of the display width; the game's FXAA writes it into the full canvas and the HUD and
+menus keep the full resolution. Mac, same spot: GPU p50 6.87 ms at 100%, 5.07 at 75% (−26%), 4.59 at 67%; at full size
+75% is hard to tell from 100%. MetalFX does not apply here (the FXAA pass upscales and anti-aliases in one step; the
+MetalFX docked hook matches the shipped 1600→1920 upscale shader only). Still to measure on the iPad itself.

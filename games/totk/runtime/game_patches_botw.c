@@ -470,15 +470,26 @@ static void patch_display(Module *m) {
         if (custom) fprintf(stderr, "[botw] TOTK_RENDER_RES=900 ignored: the display is %ux%u (TOTK_BOTW_RES), rendered at that size\n", w, h);
         else widths[1] = 1600.0f;
     }
+    /* TOTK_BOTW_RENDER_SCALE=<percent> (50..100): the 3D scene at that fraction of the display width, as the shipped docked
+       mode renders 1600 of 1920; the game's own upscale (or MetalFX, TOTK_MFX_UPSCALE) brings it to the canvas, and the HUD
+       and menus stay at the display size. */
+    const char *rs = getenv("TOTK_BOTW_RENDER_SCALE"); int scaled = rs && *rs;
+    if (scaled) {
+        int pct = atoi(rs);
+        if (pct < 50 || pct > 100) runtime_fail("TOTK_BOTW_RENDER_SCALE must be a percentage from 50 to 100");
+        widths[1] = (float)(int)(w * pct / 100.0 + 0.5);
+        fprintf(stderr, "[botw] 3D render width %.0f of the %u-pixel display (TOTK_BOTW_RENDER_SCALE=%d)\n", widths[1], w, pct);
+    }
     uint64_t extra = runtime_output_res_extra_bytes();
     uint32_t vals[5] = {w, h, display_budget(), SHIPPED_HEAP + (uint32_t)extra, SHIPPED_ARENA + (uint32_t)extra};
     memcpy(page + DISPLAY_SIZE, vals, 8); memcpy(page + DISPLAY_WIDTHS, widths, 8);
     memcpy(page + DISPLAY_BUDGET, &vals[2], 4); memcpy(page + DISPLAY_HEAP, &vals[3], 4); memcpy(page + DISPLAY_ARENA, &vals[4], 4);
     display_w = w; display_h = h;
-    if (widths[1] != widths[0]) fprintf(stderr, "[botw] docked render size 1600x900 in the 1920x1080 display, as shipped (TOTK_RENDER_RES=900)\n");
+    if (!custom && scaled) ;   /* the 3D render width line above says it */
+    else if (widths[1] != widths[0] && !scaled) fprintf(stderr, "[botw] docked render size 1600x900 in the 1920x1080 display, as shipped (TOTK_RENDER_RES=900)\n");
     else if (!custom) fprintf(stderr, "[botw] docked render size 1920x1080 (shipped: 1600x900; TOTK_RENDER_RES=900 keeps it)\n");
-    else fprintf(stderr, "[botw] docked display and render size %ux%u (TOTK_BOTW_RES): render-target budget %u MB (shipped 115), heaps and pool +%llu MB\n",
-                 w, h, vals[2] >> 20, (unsigned long long)(extra >> 20));
+    else fprintf(stderr, "[botw] docked display%s size %ux%u (TOTK_BOTW_RES): render-target budget %u MB (shipped 115), heaps and pool +%llu MB\n",
+                 scaled ? "" : " and render", w, h, vals[2] >> 20, (unsigned long long)(extra >> 20));
 }
 /* BotW 1.6.0 camera aspect producers. A data-page override keeps the iOS text immutable;
    zero retains the original calculation. Each stub preserves its scratch registers,

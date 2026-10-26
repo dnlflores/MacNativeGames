@@ -100,6 +100,20 @@ static NSString *frame_cap(void) {
     for (NSArray *o in frame_cap_options()) if ([o[0] isEqualToString:c]) return c;
     return @"default";
 }
+/* Breath of the Wild, docked and native modes: the 3D scene at a fraction of the display width (TOTK_BOTW_RENDER_SCALE,
+   game_patches_botw.c patch_display); the game's FXAA brings it to the full canvas and the HUD and menus stay at the full
+   resolution. 75% keeps native 1440p near 60 fps on an M4 iPad (GPU about 26% less work than 100%, measured 2026-10-26). */
+static NSArray<NSArray<NSString *> *> *render_scale_options(void) {
+    return @[@[@"100", @"Full (100%)", @"Sharpest; the M4 iPad holds 60 fps at native 1440p only in lighter scenes."],
+             @[@"85", @"High (85%)", @""],
+             @[@"75", @"Balanced (75%)", @"Recommended: steadier 60 fps, the HUD and menus stay at full resolution."],
+             @[@"67", @"Performance (67%)", @"Coolest; softer distant detail."]];
+}
+static NSString *render_scale(void) {
+    NSString *v = str(@"renderScale", @"75");
+    for (NSArray *o in render_scale_options()) if ([o[0] isEqualToString:v]) return v;
+    return @"75";
+}
 static NSArray<NSArray<NSString *> *> *frame_gen_options(void) {
     return @[@[@"off", @"Off", @"Every frame is rendered by the game."],
              @[@"interp30", @"30 fps game, 60 fps picture", @"The game runs at 30 fps and MetalFX creates the frames in between. Experimental."]];
@@ -489,6 +503,7 @@ NSString *totk_launcher_apply(void) {
     else if (native) { setenv("TOTK_BOTW_RES", native.UTF8String, 0); setenv("TOTK_IOS_DRAWABLE_H", "0", 0); }
     else if (docked) setenv("TOTK_IOS_DRAWABLE_H", "1080", 0);
     if (kBotW) setenv("TOTK_IOS_MATCH_DISPLAY", flag(@"matchDisplay", YES) ? "1" : "0", 0);
+    if (kBotW && docked && ![render_scale() isEqualToString:@"100"]) setenv("TOTK_BOTW_RENDER_SCALE", render_scale().UTF8String, 0);
     if (!flag(@"fpsCounter", YES)) setenv("TOTK_FPS_OVERLAY", "0", 0);
     NSString *cap = frame_cap(); if (![cap isEqualToString:@"default"]) setenv("TOTK_UNCAPPED_HZ", cap.UTF8String, 0);
     /* MetalFX frame generation finds its inputs (camera, depth, UI) in Tears of the Kingdom only: in Breath of the Wild it made
@@ -510,8 +525,8 @@ NSString *totk_launcher_apply(void) {
     if (g_aoc_mods_active) setenv("TOTK_AOC_MODS", [docs() stringByAppendingPathComponent:@".mods-active-aoc"].fileSystemRepresentation, 0);
     if (kBotW) for (NSString *c in cheats()) setenv(c.UTF8String, "1", 0);
     fprintf(stderr, "[launcher] cheats: %s\n", cheats().count ? [cheats().allObjects componentsJoinedByString:@" "].UTF8String : "none");
-    fprintf(stderr, "[launcher] graphics %s, fps counter %d, frame rate %s, frame generation %s, aniso %s, full textures %d, audio %s, controls %s, mods %s\n",
-            g.UTF8String, flag(@"fpsCounter", YES), cap.UTF8String, kBotW ? "n/a" : str(@"frameGen", @"off").UTF8String, aniso.UTF8String, flag(@"fullTextures", NO),
+    fprintf(stderr, "[launcher] graphics %s, 3D %s%%, fps counter %d, frame rate %s, frame generation %s, aniso %s, full textures %d, audio %s, controls %s, mods %s\n",
+            g.UTF8String, kBotW && docked ? render_scale().UTF8String : "100", flag(@"fpsCounter", YES), cap.UTF8String, kBotW ? "n/a" : str(@"frameGen", @"off").UTF8String, aniso.UTF8String, flag(@"fullTextures", NO),
             str(@"audioBuffer", @"normal").UTF8String, text ? "custom" : "default", g_mods_active ? "on" : "none");
     return nil;
 }
@@ -809,7 +824,10 @@ static TLForm *graphics_form(void) {
         TLRow *gen = row(@"Frame generation", option_title(frame_gen_options(), str(@"frameGen", @"off"))); gen.disclosure = YES;
         gen.tapped = ^{ push_choice(me, @"Frame generation", @"MetalFX frame interpolation. Experimental: fast motion can show artifacts.",
                                     frame_gen_options(), str(@"frameGen", @"off"), ^(NSString *v) { [defs() setObject:v forKey:@"frameGen"]; }); };
-        [disp.rows addObjectsFromArray:kBotW ? @[fps, cap] : @[fps, cap, gen]];
+        TLRow *scale = row(@"3D resolution", option_title(render_scale_options(), render_scale())); scale.disclosure = YES;
+        scale.tapped = ^{ push_choice(me, @"3D resolution", @"The world is drawn at this share of the resolution above and smoothed up to it; the HUD and menus always use the full resolution. Docked and native modes.",
+                                      render_scale_options(), render_scale(), ^(NSString *v) { [defs() setObject:v forKey:@"renderScale"]; }); };
+        [disp.rows addObjectsFromArray:kBotW ? @[fps, cap, scale] : @[fps, cap, gen]];
         return @[res, disp];
     }];
 }
