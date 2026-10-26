@@ -153,6 +153,15 @@ void runtime_front_text_test(const char *op,const char *text){(void)text;fprintf
 -(void)tick:(CADisplayLink *)l{(void)l;pthread_mutex_lock(&vsyncLock);for(unsigned i=0;i<vsyncCount;i++)hle_signal_system_event(vsyncEvents[i]);pthread_mutex_unlock(&vsyncLock);}
 @end
 static TOTKVsync *vsyncTarget;
+/* Thermal state and Low Power Mode cap the CPU and GPU clocks of the whole iPad (2026-10-26: one session ran its submit
+   thread at 1.6-1.8 GHz from the title screen on, against 3.9 GHz in every earlier log, with the same work per frame).
+   Logged at start and on every change; dm_thermal_now fills the "温控" field of the present statistics
+   (0 nominal, 1 fair, 2 serious, 3 critical). */
+int dm_thermal_now(void){return (int)NSProcessInfo.processInfo.thermalState;}
+static void power_log(const char *when){
+ static const char *names[]={"nominal","fair","serious","critical"};NSProcessInfo *p=NSProcessInfo.processInfo;NSInteger t=p.thermalState;
+ fprintf(stderr,"[totk] power %s: thermal state %s, Low Power Mode %s\n",when,t>=0&&t<4?names[t]:"unknown",p.lowPowerModeEnabled?"ON (CPU and GPU clocks capped)":"off");
+}
 
 /* Called on the main thread by the app before the game thread starts. */
 void runtime_ios_attach_layer(CAMetalLayer *layer,UIView *host){
@@ -202,6 +211,9 @@ void runtime_ios_attach_layer(CAMetalLayer *layer,UIView *host){
  [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n){(void)n;app_active_changed(1);}];
  [nc addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil queue:nil usingBlock:^(NSNotification *n){(void)n;
   fprintf(stderr,"[totk] memory warning from iOS: texture copies not in use are dropped now\n");mtl_memory_warning();}];
+ power_log("at start");
+ [nc addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n){(void)n;power_log("changed");}];
+ [nc addObserverForName:NSProcessInfoPowerStateDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n){(void)n;power_log("changed");}];
  vsyncTarget=[TOTKVsync new];displayLink=[CADisplayLink displayLinkWithTarget:vsyncTarget selector:@selector(tick:)];
  displayLink.preferredFrameRateRange=CAFrameRateRangeMake(60,60,60);[displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
 }
