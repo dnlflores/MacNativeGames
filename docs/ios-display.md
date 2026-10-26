@@ -40,7 +40,19 @@ Shared quad dimensions alone do not establish an element's bounds. This avoids
 mistaking menu panels, HUD icons or logos for backgrounds and enlarging them.
 Screen captures retain their screen mapping, so a captured HUD is not fitted twice.
 Quick-select's GPU-produced 1280×720 and 640×360 capture/blur textures qualify even
-when their aspect differs from the native iPad canvas. Static artwork and atlases
+when their aspect differs from the native iPad canvas. The smallest qualifying size (1/8) is measured
+against the 16:9 region of the target, so the shop sell screen's 320×180 backdrop capture
+keeps screen mapping too (against the 1764-row canvas it was fitted, a squeezed ghost of
+the scene behind the menu). Shop panes also blur a capture of the canvas region behind
+them (region-capture program 17dccd27 into a small target such as the text box's 1224×315).
+That capture reads the pane's layout rectangle, so it now reads the fitted rectangle (its
+c3[6].xy scale times the fit); unfitted, the button hints under the text box showed through
+it. Full-screen captures and strips of the view's whole height or width (the backdrop
+behind the item list, 960×1764) keep screen mapping both when captured and drawn back. The map screen
+draws its tiles into a layer the game sizes from the screen (3000×1764 on a 2560×1764 canvas)
+and draws it back with an overhanging quad; that layer is layout and takes the fit like the
+icons over it (with screen mapping it was 22% taller than its icons, which drifted while the
+map moved). The map then sits in the 16:9 band like its frame. Static artwork and atlases
 do not qualify. Geometry coverage uses projected coordinates after dividing by
 homogeneous W; the UI can use a perspective camera rather than an orthographic one.
 `TOTK_BOTW_UI_TRACE=1` enables bounded records of the chosen treatment.

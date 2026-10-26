@@ -22,10 +22,31 @@ static inline int botw_ui_overhang(const float xy[][2], int n) {
     for (int i=0;i<n;i++) if (fabs(xy[i][0])>1.1 || fabs(xy[i][1])>1.1) return 1;
     return 0;
 }
+/* Which view extents a quad covers completely: bit 0 the whole width, bit 1 the whole height. */
+static inline int botw_ui_span(const float xy[][2], int n) {
+    double lo[2]={1e9,1e9},hi[2]={-1e9,-1e9};
+    for(int i=0;i<n;i++)for(int a=0;a<2;a++){ if(!isfinite(xy[i][a]))return 0; lo[a]=fmin(lo[a],xy[i][a]); hi[a]=fmax(hi[a],xy[i][a]); }
+    return (lo[0]<=-.9999 && hi[0]>=.9999) | (lo[1]<=-.9999 && hi[1]>=.9999)<<1;
+}
+/* A pane that spans the view's whole height (whole width) and samples screen content exactly that tall (wide): a strip
+   of a screen capture, which keeps screen mapping in that direction. */
+static inline int botw_ui_strip(int span, unsigned w, unsigned h, unsigned target_w, unsigned target_h) {
+    return ((span & 2) && h == target_h && w < target_w) || ((span & 1) && w == target_w && h < target_h);
+}
+/* A layer the game sized from the screen (one side exactly the target's, the other different): drawn with the layout,
+   never a vignette's static artwork. The full-screen captures (the target's exact size) are classified elsewhere. */
+static inline int botw_ui_layer(unsigned w, unsigned h, unsigned target_w, unsigned target_h) {
+    return w && h && ((h == target_h && w != target_w) || (w == target_w && h != target_h));
+}
 /* Quick-select blur/capture buffers retain the game's original 16:9 dimensions.
-   Only GPU-produced images can qualify; artwork/atlases uploaded from disk cannot. */
+   Only GPU-produced images can qualify; artwork/atlases uploaded from disk cannot.
+   The smallest size (1/8) is measured against the 16:9 region of the target: the shop's
+   sell-screen backdrop is a 320x180 capture, which the target's own 1764 rows rejected
+   (fitted, it showed as a squeezed ghost of the scene behind the menu). */
 static inline int botw_ui_screen_texture(unsigned w,unsigned h,unsigned target_w,unsigned target_h,int rendered) {
-    if(!rendered || !w || !h || !target_w || !target_h || w<target_w/8 || h<target_h/8)return 0;
+    if(!rendered || !w || !h || !target_w || !target_h)return 0;
+    double rw=fmin(target_w,target_h*16.0/9),rh=fmin(target_h,target_w*9.0/16);
+    if(w<rw/8-.5 || h<rh/8-.5)return 0;
     double aspect=(double)w/h;
     return fabs(aspect*target_h/target_w-1)<.015 || fabs(aspect*9/16-1)<.015;
 }

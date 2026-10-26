@@ -7109,7 +7109,7 @@ static void botw_ui_transform(NvProg *pr, const p_draw *dw, const p_draw_idx *di
     if (!aspect || (off && !strcmp(off,"0")) || !pr || !pr->sh[0] || !mfx_ui_vs(pr->sh[0]->key) ||
         !g_mfx.swap_w || tw<g_mfx.swap_w/8 || th<g_mfx.swap_h/8 ||
         fabs((double)tw*g_mfx.swap_h / ((double)th*g_mfx.swap_w)-1)>.015) return;
-    int full=0, slid=0, sampled=0, screen=0, overhang=0;
+    int full=0, slid=0, sampled=0, screen=0, overhang=0, span=0, strip=0, layer=0;
     const char *key=pr->sh[0]->key;
     int font=!strncmp(key,"d80c41a5",8) || !strncmp(key,"08e93f03",8);
     int count=dw?dw->count:di?di->count:0, prim=dw?dw->prim:di?di->prim:-1;
@@ -7127,7 +7127,8 @@ static void botw_ui_transform(NvProg *pr, const p_draw *dw, const p_draw_idx *di
             else valid=0;
         }
         if(valid){full=botw_ui_screen_quad((const float (*)[2])xy,count,prim==5);overhang=full && botw_ui_overhang((const float (*)[2])xy,count);
-                  slid=!full && botw_ui_quad((const float (*)[2])xy,count,prim==5,1);}
+                  slid=!full && botw_ui_quad((const float (*)[2])xy,count,prim==5,1);
+                  span=botw_ui_span((const float (*)[2])xy,count);}
     }
     static int trace=-1; static char seen[64][40]; static int nseen;
     if(trace<0)trace=getenv("TOTK_BOTW_UI_TRACE")!=NULL;
@@ -7150,12 +7151,25 @@ static void botw_ui_transform(NvProg *pr, const p_draw *dw, const p_draw_idx *di
         /* Copied or filtered screen pixels count as screen content whatever their texture's shape (strips, full
            captures); botw_ui_screen_fill then decides the mapping from the quad. */
         if(copied || (serial && botw_ui_screen_texture(w,h,(unsigned)tw,(unsigned)th,botw_ui_screen_content(serial))))screen=1;
+        if((copied || (serial && botw_ui_screen_content(serial))) && botw_ui_strip(span,w,h,(unsigned)tw,(unsigned)th))strip=1;
+        if(!copied && botw_ui_layer(w,h,(unsigned)tw,(unsigned)th))layer=1;
     }
+    /* The map screen draws its tiles into a layer the game sizes from the screen (3000x1764 on a 2560x1764 canvas: the
+       layout's 1500x720 at the canvas scale) and draws that back with a quad overhanging the view. Its contents are
+       layout, positioned with the icons and labels drawn over them, so it takes the layout fit too; with screen mapping
+       (the overhanging-vignette rule) the map came out 22% taller than its icons, which drifted off their places while
+       the map moved and put stamps somewhere else than the cursor showed. */
+    if(layer)overhang=0;
     /* The pause menu's page switch slides the old page's screen capture out and the new page's backdrop in as
        view-sized quads offset sideways. Drawing a screen capture, they keep screen mapping like the settled quad;
        fitted, the capture shrank to the 16:9 band for the slide and jumped back when it ended. Offset artwork stays
        fitted. */
     if(slid && screen)full=1;
+    /* A pane spanning the whole view in the fitted direction that samples screen content of the view's whole extent
+       there (the shop's 960x1764 capture strip behind the dialogue): fitted, the strip's full-height picture shrank into
+       the 16:9 band, a squeezed ghost of the previous frame (menu text included) behind the menu. It keeps screen
+       mapping like a full-view capture. */
+    if(strip)full=1,screen=1;
     int fill=botw_ui_screen_fill(full,scfull,screen,sampled,overhang);
     botw_ui_scale scale=botw_ui_fit(aspect,fill);*ux=1/scale.x;*uy=scale.y;
     /* Bounded diagnostics: one record per shader, treatment and inputs, enabled explicitly. */
@@ -7203,6 +7217,44 @@ static uint64_t ui_mat_patch(const p_bind_buf *u, void *mb, uint64_t mo) {
     return lg;
 }
 #if GAME_BOTW
+/* Frosted dialogue / menu panes (the shop's text box, its item card): the game first copies the canvas region behind the
+   pane into a small target with the region-capture program (vertex 17dccd27), blurs it and draws it back as the pane.
+   The capture's texture coordinates come from the pane's layout rectangle, 0.5 + (corner / 2 + c3[5].zw) * c3[6].xy in
+   canvas units, while the pane itself is drawn with the 16:9 layout fit: on a taller canvas it read rows outside the
+   fitted pane (the button hints under the shop's text box showed through it, offset). The capture now reads the fitted
+   rectangle: c3[6].xy is scaled by the fit about the canvas centre, as the pane is. */
+static double g_botw_cap_sx = 1, g_botw_cap_sy = 1;
+static uint64_t botw_capture_patch(const p_bind_buf *u, uint64_t gpu) {
+    enum { RING = 1 << 20 }; static __strong id<MTLBuffer> ring; static uint64_t ring_gpu; static size_t at;
+    if (!ring) { ring = [g_dev newBufferWithLength:RING options:MTLResourceStorageModeShared]; res_add(ring); ring_gpu = ring.gpuAddress; }
+    enum { USED = 112, COPY = 256 };   // the program reads c3[0..6] (the block is bound as binding 0, 64 KiB)
+    if (u->size < USED) return 0;
+    size_t copy = u->size < COPY ? u->size : COPY;
+    const usnap_t *sc = usnap_find(u->addr, copy); void *mb; uint64_t mo;
+    const uint8_t *src = sc ? sc->cpu + (u->addr - sc->lo) : mtl_addr(u->addr, copy, &mb, &mo) ? (const uint8_t *)[(__bridge id<MTLBuffer>)mb contents] + mo : NULL;
+    if (!src) return 0;
+    if (at + COPY > RING) at = 0;
+    uint8_t *dst = (uint8_t *)ring.contents + at; memcpy(dst, src, copy);
+    float sc6[2]; memcpy(sc6, dst + 96, 8);
+    sc6[0] *= (float)g_botw_cap_sx; sc6[1] *= (float)g_botw_cap_sy; memcpy(dst + 96, sc6, 8);
+    (void)gpu; uint64_t r = ring_gpu + at; at += COPY;
+    return r;
+}
+/* The region-capture program reading the canvas into a smaller target, with the display-shaped canvas: the fit scale
+   (botw_ui_fit), 1 otherwise. TOTK_BOTW_CAPTURE_FIT=0 turns it off (A/B). */
+static void botw_capture_fit(NvProg *pr, NSUInteger tw, NSUInteger th) {
+    double sx = 1, sy = 1; static int on = -1; if (on < 0) { const char *e = getenv("TOTK_BOTW_CAPTURE_FIT"); on = !(e && !strcmp(e, "0")); }
+    /* Not the full-screen captures (1280x720, 640x360) nor strips of the view's whole height or width (the shop's
+       backdrop behind its item list): those are drawn back with screen mapping (botw_ui_screen_texture, botw_ui_strip). */
+    if (on && pr && pr->sh[0] && pr->sh[1] && !strncmp(pr->sh[0]->key, "17dccd27", 8) && uw_ratio() && g_mfx.swap_w && tw != g_mfx.swap_w && th != g_mfx.swap_h &&
+        !botw_ui_screen_texture((unsigned)tw, (unsigned)th, g_mfx.swap_w, g_mfx.swap_h, 1)) {
+        int canvas = 0; NvShader *fs = pr->sh[1];
+        for (int i = 0; i < fs->rf.nb; i++) { const nvn_rbind *b = &fs->rf.b[i]; if (b->kind != NVN_RB_TEX || b->reg < 0 || b->reg >= 128) continue;
+            int tid = (int)(S.tex[1][b->reg] & 0xfffff); registry_lock(); if (tid > 0 && tid < g_ntreg && g_treg[tid].ok && g_treg[tid].t.serial == g_mfx.canvas) canvas = 1; registry_unlock(); }
+        if (canvas) { botw_ui_scale f = botw_ui_fit(uw_ratio(), 0); sx = f.x; sy = f.y; }
+    }
+    if (sx != g_botw_cap_sx || sy != g_botw_cap_sy) { g_botw_cap_sx = sx; g_botw_cap_sy = sy; args_dirty_stage(0); }
+}
 /* Inventory Link (and other UI previews) with the display-shaped canvas (TOTK_ASPECT): the off-centre preview camera
    gets the display aspect and keeps its vertical field of view, so the model comes out canvas-aspect / (16:9) times
    larger than the 16:9 menu fitted around it. Every binding of such a camera block (geometry, lighting, any stage) gets
@@ -7425,6 +7477,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             else { const usnap_t *sc = usnap_find(u->addr, u->size ? u->size : 1); if (sc) gpu = sc->gpu + (u->addr - sc->lo); }   // TOTK: contents as of the submit call
 #if GAME_BOTW
             if (u->size == MFX_CAM_SIZE) { uint64_t pg = botw_preview_cam(u, gpu, (__bridge id<MTLBuffer>)mb); if (pg) gpu = pg; }   // inventory preview camera
+            if (nvn_stage == 0 && reg == 0 && (g_botw_cap_sx != 1 || g_botw_cap_sy != 1)) { uint64_t pg = botw_capture_patch(u, gpu); if (pg) gpu = pg; }   // region capture of a fitted pane
 #endif
             if (bl) {
                 PD("B %llu st%d cb reg%d addr=%#llx size=%llu pool=%#llx+%#llx f=%g,%g,%g,%g", g_stat_pass, nvn_stage, reg, (unsigned long long)u->addr, (unsigned long long)u->size,
@@ -10300,6 +10353,7 @@ frz_plain:;
     double uy = 1, cy = th / 2.0;
 #if GAME_BOTW
     botw_ui_transform(pr, dw, di, tw, th, &ux, &uy);
+    botw_capture_fit(pr, tw, th);
     botw_ui_note_render(pr);
 #endif
     if (ux != 1) { vx = cx + (vx - cx) / ux; vw /= ux; }

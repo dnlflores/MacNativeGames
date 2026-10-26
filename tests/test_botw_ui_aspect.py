@@ -121,6 +121,20 @@ int main(void){{
  assert(botw_ui_screen_texture(1280,720,2560,1764,1));
  assert(botw_ui_screen_texture(640,360,2560,1764,1));
  assert(botw_ui_screen_texture(1280,882,2560,1764,1));
+ assert(botw_ui_screen_texture(320,180,2560,1764,1));   /* shop sell-screen backdrop */
+ /* The shop's backdrop strips: the view's whole height (or width) of screen content keep screen mapping. */
+ const float tall[6][2]={{{{-1,-1}},{{-.25f,-1}},{{-1,1}},{{-1,1}},{{-.25f,-1}},{{-.25f,1}}}};
+ assert(botw_ui_span(tall,6)==2);
+ assert(botw_ui_strip(botw_ui_span(tall,6),960,1764,2560,1764));
+ assert(!botw_ui_strip(botw_ui_span(tall,6),960,1440,2560,1764));
+ assert(botw_ui_strip(1,2560,980,2560,1764));
+ assert(!botw_ui_strip(0,960,1764,2560,1764));
+ /* The map screen's tile layer (sized from the screen) is layout, not a vignette's artwork. */
+ assert(botw_ui_layer(3000,1764,2560,1764));
+ assert(!botw_ui_layer(2560,1764,2560,1764));
+ assert(!botw_ui_layer(1024,1024,2560,1764));
+ assert(!botw_ui_screen_texture(160,90,2560,1764,1));
+ assert(botw_ui_screen_texture(160,90,1280,720,1));
  assert(!botw_ui_screen_texture(1280,720,2560,1764,0));
  assert(!botw_ui_screen_texture(840,840,2560,1764,1));
  assert(!botw_ui_screen_texture(192,235,2560,1764,1));
