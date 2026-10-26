@@ -3996,7 +3996,9 @@ void ts_after(void);
 // For the decision see mtl_sub_index / sdx_decide; only what can be proven within the same submission is accepted, and anything still undecided at the end of the submission is always written back.
 typedef struct { uint64_t ser, bytes; uint32_t lv, sl; int idx; uint8_t depth, state, ridx, drawn, why, load, wrote, wwhy; const char *wkey; int wslot; } sd_att;   // depth：0 颜色 1 深度 2 模板（深度模板合一的贴图两部分分开判）   // state 0 未定 1 需要 2 多余；idx：颜色附件序号，深度为 -1 | depth: 0 color 1 depth 2 stencil (the two parts of a combined depth-stencil texture are decided separately)   // state 0 undecided 1 needed 2 redundant; idx: color attachment index, -1 for depth
 static sd_att g_sd[9]; static int g_nsd;
-static unsigned g_sd_plain;   // TOTK: g_sd entries (bit i) written in this encoder by a draw that samples none of its attachments (att_unstored_read)
+static unsigned g_sd_plain;   // TOTK: g_sd entries (bit i) written in this encoder by a draw that does not sample that attachment itself (att_unstored_read)
+static unsigned g_sd_draw_wrote;   // TOTK: g_sd entries the current draw writes (udc_note_draw)
+static uint64_t g_att_store_splits;   // passes stored before a draw that samples what the pass drew (att_unstored_read)
 static int g_udc_ab = -1, g_udc_ab_on;
 // 本通道没写的附件（只做深度 / 模板测试、颜色写掩码为 0 等）写回改 DontCare：内容本就在内存里，免一次整块写回。
 // 缺省开：Mac 同进程开 / 关截图与空对照同分布；A19 Pro 私有 Depth32F_S8 / RGBA8 DontCare 后读回 0 处不同。
@@ -5759,14 +5761,17 @@ static void udc_note_draw(NvProg *pr) {
     if (pr && pr->udc_img) zskip_clear();   // 图像槽可写：保守清空 | Image slots are writable: conservatively clear
     int image_write = pr ? pr->udc_imgw : 0;
     uint32_t shader_color_mask = pr ? pr->udc_cmask : 0;
+    g_sd_draw_wrote = 0;
     for (int i = 0; i < g_nsd; i++) {
-        sd_att *t = &g_sd[i];
+        sd_att *t = &g_sd[i]; int was = t->wrote; t->wrote = 0;
         if (image_write) { t->wrote = 1; t->wwhy = 1; }
         else if (t->depth == 0 && t->idx >= 0 && (((S.chmask.mask >> (4 * t->idx)) & 0xf) || (shader_color_mask >> t->idx & 1))) { t->wrote = 1; t->wwhy = (S.chmask.mask >> (4 * t->idx)) & 0xf ? 2 : 3; }
         else if (t->depth == 1 && S.ds.dw) { t->wrote = 1; t->wwhy = 4; }
         else if (t->depth == 2 && S.ds.st && (S.st_wmask[0] || S.st_wmask[1])
                 && (S.ds.fail_f != NVN_STENCIL_OP_KEEP || S.ds.zfail_f != NVN_STENCIL_OP_KEEP || S.ds.zpass_f != NVN_STENCIL_OP_KEEP
                     || S.ds.fail_b != NVN_STENCIL_OP_KEEP || S.ds.zfail_b != NVN_STENCIL_OP_KEEP || S.ds.zpass_b != NVN_STENCIL_OP_KEEP)) { t->wrote = 1; t->wwhy = 5; }
+        if (t->wrote) g_sd_draw_wrote |= 1u << i;
+        t->wrote |= was;
     }
 }
 static void state_reset(void) {
@@ -10256,6 +10261,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     uint64_t att_rs[ATT_READS_MAX]; int att_n = att_store_on() ? draw_att_reads(pr, att_rs) : 0;
     if (!(g_fz.active && g_fz.phase == 2) && att_unstored_read(att_rs, att_n)) {
         static int once; if (!once++) MLOG("[totk] a draw samples an attachment its pass drew: the pass is stored first (first: pass %llu)", g_stat_pass);
+        if (++g_att_store_splits % 2000 == 0) MLOG("[totk] passes stored before a draw sampling what they drew: %llu (frame %llu)", (unsigned long long)g_att_store_splits, (unsigned long long)atomic_load(&g_cur_frame));
         PD("M %llu 绘制采样本通道画过的附件，先写回再画", g_stat_pass); rp_flush(); }
     static id<MTLFunction> fz_fn;   // 合并通道后一个通道本次绘制的特化片元函数（nil = 用原版本） | Specialized fragment function for this draw of the later pass in a merged render pass (nil = use the original version)
     if (g_fz.active && g_enc && g_fz.phase == 2 && !fz_p2_draw(pr, dw, di, g_fz.lmap2, &fz_fn)) {   // 证不出：结束合并通道（前一个通道的结果照常写回），按后一个通道的原目标重开 | Cannot be proven: end the merged render pass (the earlier pass's result is stored as usual) and reopen with the later pass's original targets
@@ -10525,7 +10531,16 @@ frz_plain:;
     rr_snap(dw,di);
 #endif
     udc_note_draw(pr);
-    if (!att_n) for (int i = 0; i < g_nsd; i++) if (g_sd[i].wrote) g_sd_plain |= 1u << i;   // att_unstored_read: draws of a sampling run do not count
+    /* att_unstored_read: an attachment this draw writes without sampling it. BotW's terrain water (31b5af2d/2b8863c5)
+       samples the linear depth attached in its pass while it writes the G-buffer; the pond water drawn next in the same
+       pass (98984c7b/9a391252, the basin by Ha Dahamar's waterfall) samples that G-buffer to blend over it. Counting only
+       draws that sample none of the pass's attachments missed the terrain water's writes: the pond read the G-buffer from
+       before the pass (the basin's bed) and came out clear. A run of draws that read and write the same attachment (the
+       terrain marking its own pixel) still does not split until a draw sampling none of them follows (the old rule, kept).
+       TOTK_ATT_STORE_PER_ATT=0: only the old rule (A/B). */
+    { static int per_att = -1; if (per_att < 0) { const char *e = getenv("TOTK_ATT_STORE_PER_ATT"); per_att = !(e && !strcmp(e, "0")); }
+      if (per_att) for (int i = 0; i < g_nsd; i++) if ((g_sd_draw_wrote >> i & 1) && !has_ser(att_rs, att_n, g_sd[i].ser)) g_sd_plain |= 1u << i;
+      if (!att_n) for (int i = 0; i < g_nsd; i++) if (g_sd[i].wrote) g_sd_plain |= 1u << i; }
     // 0 个图元的绘制（游戏会发 count=0）不画任何像素，跳过编码；Metal 规定计数必须非零，校验层否则当场中止（营地 / 野外 / 战斗页实测）
     // A draw with 0 primitives (the game does send count=0) draws no pixels, so skip encoding; Metal requires the count to be non-zero, otherwise the validation layer aborts on the spot (measured on the camp / wilderness / combat pages)
     if (dw && prim == 7) {   // 四边形：共享索引 0,1,2,0,2,3 | Quads: shared indices 0,1,2,0,2,3

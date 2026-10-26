@@ -53,3 +53,13 @@ draws the 3D scene at that share of the display width; the game's FXAA writes it
 menus keep the full resolution. Mac, same spot: GPU p50 6.87 ms at 100%, 5.07 at 75% (−26%), 4.59 at 67%; at full size
 75% is hard to tell from 100%. MetalFX does not apply here (the FXAA pass upscales and anti-aliases in one step; the
 MetalFX docked hook matches the shipped 1600→1920 upscale shader only). Still to measure on the iPad itself.
+
+## BotW pond water: one more pass store per frame (2026-10-26)
+
+The basin by Ha Dahamar's waterfall drew clear: the pond water (FS 9a391252) blends over the G-buffer that the terrain
+water (FS 2b8863c5) wrote earlier in the same Metal pass, and on a tile GPU that sample read the G-buffer from before the
+pass. The store-before-sample rule in `nvn_mtl.m` (att_unstored_read) now also counts an attachment a draw writes
+without sampling it, so the pass is stored before the pond water. Cost, Mac with the iPad canvas: one extra store in
+frames that draw pond water (the waterfall rim, Dueling Peaks Stable, the shop save), none in the three saves without
+it; GPU p50 +0.37 ms at the rim (7.02 → 7.39, now including the water itself), unchanged at the stable (6.66 → 6.65).
+`TOTK_ATT_STORE_PER_ATT=0` turns the new part off for A/B.
