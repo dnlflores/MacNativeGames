@@ -10,6 +10,11 @@ extern "C" {
    (name, version, description, option_groups) as JSON. */
 char *totk_ukmm_convert(const char *bnp, const char *romfs, const char *aoc, const char *work, const char *lang,
                         const char *out_zip, char **meta_json);
+/* Packs the RomFS mod folder mod_romfs (files under the game's own paths) into the UKMM mod out_zip called name, so
+   Play merges its edits to shared files instead of one mod's copy replacing the others; *meta_json (may be NULL)
+   receives the metadata as JSON. */
+char *totk_ukmm_pack(const char *mod_romfs, const char *name, const char *romfs, const char *aoc, const char *work,
+                     const char *out_zip, char **meta_json);
 /* Merges the UKMM mods of mods_json ([{"path": zip, "options": [option paths]}], lowest priority first) into out_dir:
    01007EF00011E000/romfs (base game) and 01007EF00011F001/romfs (add-on content), resource size table included. */
 char *totk_ukmm_merge(const char *mods_json, const char *romfs, const char *aoc, const char *lang, const char *out_dir);

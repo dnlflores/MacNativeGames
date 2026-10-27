@@ -10,6 +10,22 @@ index c40ea72..b12edf2 100644
  
  ]
  
+diff --git a/crates/uk-content/src/actor/params/shop.rs b/crates/uk-content/src/actor/params/shop.rs
+index 8316380..11ad6ed 100644
+--- a/crates/uk-content/src/actor/params/shop.rs
++++ b/crates/uk-content/src/actor/params/shop.rs
+@@ -158,8 +158,10 @@ impl From<ShopData> for ParameterIO {
+                         .into_iter()
+                         .chain(table.into_iter().enumerate().flat_map(|(i, (name, data))| {
+                             let i = i + 1;
++                            // Numbered in table order like BCML (mergers/shop.py): mods made for it reuse
++                            // the same sort values for the items they add, so keeping those collides.
+                             [
+-                                (format!("ItemSort{:03}", i), Parameter::I32(data.sort)),
++                                (format!("ItemSort{:03}", i), Parameter::I32(i as i32 - 1)),
+                                 (
+                                     format!("ItemName{:03}", i),
+                                     Parameter::String64(Box::new(name)),
 diff --git a/crates/uk-manager/src/core.rs b/crates/uk-manager/src/core.rs
 index 046e145..5c0cc47 100644
 --- a/crates/uk-manager/src/core.rs

@@ -34,8 +34,9 @@ Automatic installation accepts ZIP and RAR archives up to 512 MB compressed and 
 Stored/deflated ZIPs and RAR/RAR5 archives are supported. RAR decoding uses pinned libarchive 3.8.9. Encrypted/split/ZIP64 archives, unsafe or duplicate paths,
 links, and packages containing code patches, DLC replacements or Wii U content are rejected. RAR extraction also has a two-minute time limit.
 Each successful download gets a new mod folder, preserving previous installs. Reinstalling a mod
-creates a separate entry; disable or delete the old entry in Mods. Multiple installed mods still
-follow the launcher's file replacement order, without content merging.
+creates a separate entry; disable or delete the old entry in Mods. In BotW, Play merges the installed
+mods' game data with UKMM (below); in TotK they follow the launcher's file replacement order, without
+content merging.
 
 For 7z downloads, unsupported package layouts, or a site that blocks embedded browsing, use
 the existing manual folder import:
@@ -43,10 +44,10 @@ the existing manual folder import:
 1. Download a mod explicitly made for Switch BotW 1.6.0 and extract the archive in Files
    (use an archive app if Files cannot extract its format).
 2. Return to **Mods → Import a mod folder…**. Select the folder directly containing `romfs`,
-   or the `romfs` folder itself. For an Atmosphere package, select
-   `atmosphere/contents/01007EF00011E000`, rather than the whole extracted archive.
-3. Enable the imported mod, arrange its order, and press Play. A lower mod wins when two change
-   the same file; the launcher does not merge the contents of that file. Back up saves first.
+   or the `romfs` folder itself. A folder holding `atmosphere/contents/01007EF00011E000/romfs`
+   (an SD card layout copied whole) also works.
+3. Enable the imported mod, arrange its order, and press Play. Back up saves first. Play merges the
+   mods' game data (below); when two replace the same model or texture, the lower one wins.
 
 Limitations:
 
@@ -64,10 +65,13 @@ BCML packages (`.bnp`, BotW):
   `games/totk/ios/tools/build_ukmm.py`) converts it against the app's own game data (`games/totk/tools/ukmm_bridge`).
   The package becomes an entry in Mods; tap it to choose its options (required groups start on their default
   or first option).
-- Play merges every enabled package with UKMM's mergers (packs, game data and save flags, actor info, map units,
-  texts, parameter deep merges, the resource size table), in the Mods order, into the lowest layer: RomFS mod folders
-  load above it and replace whole files. The merge is redone only when the packages, their order or options, or the
-  game language change. Text merges use the language the game runs in (US English, or the EU/JP/KR/CN text of the
+- Play merges every enabled package with UKMM's mergers (packs, game data and save flags, actor info, shop lists,
+  map units, texts, parameter deep merges, the resource size table), in the Mods order. RomFS mod folders take part
+  too: UKMM packs each one against the game's own files into the folder's hidden `.ukmm-pack.zip` (again only when
+  its files change), so standalone item mods that each ship a whole `Npc_TripMaster_00` (Beedle's shop),
+  `ActorInfo.product.sbyml` and `Bootup.pack` add up instead of the last one hiding the others. Shop item sort numbers
+  are renumbered in table order, as BCML does. A folder UKMM cannot read loads as whole files above the merge (the log
+  names it). The merge is redone only when the mods, their order or options, or the game language change. Text merges use the language the game runs in (US English, or the EU/JP/KR/CN text of the
   device language, as `runtime/services.c` reports it).
 - DLC files of the merged packages are served by `runtime/aoc_romfs.c` (`TOTK_AOC_MODS`, a manifest like the base
   game's).

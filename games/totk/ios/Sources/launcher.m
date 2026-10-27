@@ -6,7 +6,8 @@
    - Mods: RomFS mod folders in Documents/Mods (the Files app shows them), on / off and in order; Play links the enabled
      ones into one folder with a manifest (runtime/romfs.c, "*" originals) -> TOTK_ROMFS_MODS. Breath of the Wild also
      takes BCML packages (.bnp): UKMM converts each into a mod folder (tools/ukmm_bridge), and Play merges the enabled ones
-     into the lowest layer, their add-on content files -> TOTK_AOC_MODS (runtime/aoc_romfs.c).
+     and the RomFS folders (packed by UKMM) into that folder, their add-on content files -> TOTK_AOC_MODS
+     (runtime/aoc_romfs.c).
    - Saves: export / import through the Files app, backups (automatic when starting, the last five kept), restore.
    Everything is stored in NSUserDefaults or in Documents and becomes the game's environment when Play is pressed. */
 #import "launcher.h"
@@ -243,9 +244,15 @@ static NSString *install_saves(NSString *from, NSString *why) {
 // ---------- mods ----------
 static NSString *mods_dir(void) { NSString *d = [docs() stringByAppendingPathComponent:@"Mods"]; [fm() createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil]; return d; }
 static NSString *mods_active_dir(void) { return [docs() stringByAppendingPathComponent:@".mods-active"]; }
+/* The mod's romfs folder: at its top, or inside a Switch SD card layout copied whole (atmosphere/contents/<title>/romfs). */
 static NSString *mod_root(NSString *name) {
-    NSString *m = [mods_dir() stringByAppendingPathComponent:name], *r = [m stringByAppendingPathComponent:@"romfs"];
-    return is_dir(r) ? r : m;
+    NSString *m = [mods_dir() stringByAppendingPathComponent:name], *title = kBotW ? @"01007EF00011E000" : @"0100F2C0115B6000";
+    for (NSString *sub in @[@"romfs", [NSString stringWithFormat:@"atmosphere/contents/%@/romfs", title],
+                            [NSString stringWithFormat:@"atmosphere/titles/%@/romfs", title], [title stringByAppendingPathComponent:@"romfs"]]) {
+        NSString *r = [m stringByAppendingPathComponent:sub];
+        if (is_dir(r)) return r;
+    }
+    return m;
 }
 static BOOL mod_has_exefs(NSString *name) { return is_dir([[mods_dir() stringByAppendingPathComponent:name] stringByAppendingPathComponent:@"exefs"]); }
 /* The installed mods in the player's order (new folders at the end, by name). */
@@ -362,28 +369,69 @@ static BOOL is_7z(NSURL *url) {
     FILE *f = fopen(url.fileSystemRepresentation, "rb"); uint8_t m[6] = {0}; size_t n = f ? fread(m, 1, 6, f) : 0; if (f) fclose(f);
     return n == 6 && !memcmp(m, "7z\xbc\xaf\x27\x1c", 6);
 }
-/* Merges the enabled BCML packages (in the mod order) into Documents/.ukmm-merged when they, their options or the
-   language changed; *base / *aoc receive the merged base-game and add-on content folders (nil: none). */
-static NSString *merge_ukmm(NSSet *on, void (^progress)(NSString *), NSString **base, NSString **aoc) {
-    *base = *aoc = nil;
+#ifdef GAME_BOTW
+/* A RomFS mod folder as a UKMM mod, so Play merges its edits to shared files (actor list, shop lists, game flags, text)
+   with the other mods instead of the last mod's copy of each file replacing the rest (standalone armour mods each ship
+   a whole Beedle shop, ActorInfo and Bootup.pack). Packed into the folder's hidden .ukmm-pack.zip, again only when its
+   files change. Returns the zip, or nil with *error. */
+static NSString *pack_romfs_mod(NSString *name, NSDictionary<NSString *, NSString *> *files, void (^progress)(NSString *), NSString **error) {
+    NSString *dir = [mods_dir() stringByAppendingPathComponent:name], *romfs = game_romfs();
+    NSString *zip = [dir stringByAppendingPathComponent:@".ukmm-pack.zip"], *sigPath = [dir stringByAppendingPathComponent:@".ukmm-pack.signature"];
+    NSMutableString *sig = [NSMutableString string];
+    for (NSString *rel in [files.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+        NSDictionary *a = [fm() attributesOfItemAtPath:files[rel] error:nil];
+        [sig appendFormat:@"%@\t%llu\t%f\n", rel, a.fileSize, a.fileModificationDate.timeIntervalSince1970];
+    }
+    if ([fm() fileExistsAtPath:zip] && [[NSString stringWithContentsOfFile:sigPath encoding:NSUTF8StringEncoding error:nil] isEqualToString:sig]) return zip;
+    if (!romfs) { *error = @"the game's data was not found"; return nil; }
+    dispatch_async(dispatch_get_main_queue(), ^{ progress([NSString stringWithFormat:@"Converting %@", name]); });
+    [fm() removeItemAtPath:sigPath error:nil];
+    NSString *work = [NSTemporaryDirectory() stringByAppendingPathComponent:[@"ukmm-pack-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+    char *err = totk_ukmm_pack(mod_root(name).fileSystemRepresentation, name.UTF8String, romfs.fileSystemRepresentation,
+                               game_aoc().fileSystemRepresentation, work.fileSystemRepresentation, zip.fileSystemRepresentation, NULL);
+    [fm() removeItemAtPath:work error:nil];
+    if (err) { *error = @(err); totk_ukmm_free(err); [fm() removeItemAtPath:zip error:nil]; return nil; }
+    [sig writeToFile:sigPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    fprintf(stderr, "[launcher] mod %s: %lu files packed by UKMM for merging\n", name.UTF8String, (unsigned long)files.count);
+    return zip;
+}
+#endif
+/* Merges the enabled BCML packages and (with folders, Breath of the Wild) RomFS mod folders, in the mod order, into
+   Documents/.ukmm-merged when they, their options or the language changed; *base / *aoc receive the merged base-game
+   and add-on content folders (nil: none), `merged` the names of the mods merged. */
+static NSString *merge_ukmm(NSSet *on, BOOL folders, void (^progress)(NSString *), NSString **base, NSString **aoc, NSMutableSet *merged) {
+    *base = *aoc = nil; (void)folders;
     NSMutableArray *list = [NSMutableArray array]; NSMutableString *sig = [NSMutableString stringWithFormat:@"%@\n", ukmm_lang()];
     for (NSString *name in installed_mods()) {
-        if (![on containsObject:name] || !is_ukmm(name)) continue;
+        if (![on containsObject:name]) continue;
         NSString *zip = [[mods_dir() stringByAppendingPathComponent:name] stringByAppendingPathComponent:@"mod.zip"];
-        NSArray *opts = ukmm_info(name)[@"options"] ?: @[]; NSDictionary *a = [fm() attributesOfItemAtPath:zip error:nil];
+        NSArray *opts = @[];
+        if (is_ukmm(name)) opts = ukmm_info(name)[@"options"] ?: @[];
+#ifdef GAME_BOTW
+        else if (folders) {
+            NSDictionary *files = mod_files(name); NSString *error = nil;
+            if (!files.count) continue;
+            if (!(zip = pack_romfs_mod(name, files, progress, &error))) {
+                fprintf(stderr, "[launcher] mod %s: UKMM could not read it (%s); its files load whole, above the merge\n", name.UTF8String, error.UTF8String);
+                continue;
+            }
+        }
+#endif
+        else continue;
+        NSDictionary *a = [fm() attributesOfItemAtPath:zip error:nil];
         if (!a) return [NSString stringWithFormat:@"The BCML package %@ is missing its converted files. Delete it and install it again.", name];
-        [list addObject:@{@"path": zip, @"options": opts}];
+        [list addObject:@{@"path": zip, @"options": opts}]; [merged addObject:name];
         [sig appendFormat:@"%@\t%llu\t%f\t%@\n", zip, a.fileSize, a.fileModificationDate.timeIntervalSince1970, [opts componentsJoinedByString:@"|"]];
     }
     NSString *out = [docs() stringByAppendingPathComponent:@".ukmm-merged"], *sigPath = [docs() stringByAppendingPathComponent:@".ukmm-merged.signature"];
     if (!list.count) { [fm() removeItemAtPath:out error:nil]; [fm() removeItemAtPath:sigPath error:nil]; return nil; }
 #ifdef GAME_BOTW
     if (![[NSString stringWithContentsOfFile:sigPath encoding:NSUTF8StringEncoding error:nil] isEqualToString:sig]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ progress([NSString stringWithFormat:@"Merging %lu BCML package%@", (unsigned long)list.count, list.count == 1 ? @"" : @"s"]); });
+        dispatch_async(dispatch_get_main_queue(), ^{ progress([NSString stringWithFormat:@"Merging %lu mod%@", (unsigned long)list.count, list.count == 1 ? @"" : @"s"]); });
         [fm() removeItemAtPath:sigPath error:nil];
         NSString *json = [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:list options:0 error:nil] encoding:NSUTF8StringEncoding];
         char *err = totk_ukmm_merge(json.UTF8String, game_romfs().fileSystemRepresentation, game_aoc().fileSystemRepresentation, ukmm_lang().UTF8String, out.fileSystemRepresentation);
-        if (err) { NSString *m = [NSString stringWithFormat:@"The BCML packages could not be merged: %s", err]; totk_ukmm_free(err); return m; }
+        if (err) { NSString *m = [NSString stringWithFormat:@"The mods could not be merged: %s", err]; totk_ukmm_free(err); return m; }
         [sig writeToFile:sigPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
 #endif
@@ -404,15 +452,22 @@ static NSDictionary<NSString *, NSString *> *folder_files(NSString *root) {
 }
 static BOOL g_mods_active, g_aoc_mods_active;
 static NSString *link_layer(NSDictionary<NSString *, NSString *> *pick, NSString *active, NSString *what, void (^progress)(NSString *));
-/* The enabled mods: BCML packages merged first (the lowest layer), then the RomFS mods in order (a later mod wins a
-   path); the add-on content files of the packages go to their own layer (TOTK_AOC_MODS). */
+/* The enabled mods: the UKMM merge first (the lowest layer: BCML packages and, in Breath of the Wild, the RomFS mod
+   folders), then any RomFS mods left out of it in order (a later mod wins a path); the add-on content files of the
+   merge go to their own layer (TOTK_AOC_MODS). */
 static NSString *prepare_mods(void (^progress)(NSString *)) {
     NSString *active = mods_active_dir(), *aocActive = [docs() stringByAppendingPathComponent:@".mods-active-aoc"]; g_mods_active = g_aoc_mods_active = NO;
     NSSet *on = enabled_mods(); NSMutableDictionary<NSString *, NSString *> *pick = [NSMutableDictionary dictionary];
-    NSString *mergedBase = nil, *mergedAoc = nil, *error = merge_ukmm(on, progress, &mergedBase, &mergedAoc);
+    NSMutableSet *merged = [NSMutableSet set];
+    NSString *mergedBase = nil, *mergedAoc = nil, *error = merge_ukmm(on, YES, progress, &mergedBase, &mergedAoc, merged);
+    BOOL folders = NO; for (NSString *name in merged) folders |= !is_ukmm(name);
+    if (error && folders) {   // a folder UKMM cannot merge: load the folders as whole files on top, as before
+        fprintf(stderr, "[launcher] %s; merging the BCML packages only\n", error.UTF8String);
+        [merged removeAllObjects]; error = merge_ukmm(on, NO, progress, &mergedBase, &mergedAoc, merged);
+    }
     if (error) return error;
     if (mergedBase) [pick addEntriesFromDictionary:folder_files(mergedBase)];
-    for (NSString *name in installed_mods()) if ([on containsObject:name]) [pick addEntriesFromDictionary:mod_files(name)];
+    for (NSString *name in installed_mods()) if ([on containsObject:name] && ![merged containsObject:name]) [pick addEntriesFromDictionary:mod_files(name)];
     NSDictionary *aocPick = mergedAoc ? folder_files(mergedAoc) : @{};
     if (aocPick.count) { if ((error = link_layer(aocPick, aocActive, @"add-on content", progress))) return error; g_aoc_mods_active = YES; }
     else [fm() removeItemAtPath:aocActive error:nil];
@@ -953,7 +1008,8 @@ static TLForm *ukmm_options_form(NSString *name) {
 static TLForm *mods_form(void) {
     TLForm *form = [[TLForm alloc] initWithTitle:@"Mods" build:^NSArray<TLSection *> *(TLForm *me) {
         NSArray *mods = installed_mods(); NSSet *on = enabled_mods();
-        TLSection *list = section(@"Installed", mods.count ? @"Mods load from top to bottom: when two change the same file, the lower one wins. Tap Edit to change the order."
+        TLSection *list = section(@"Installed", mods.count ? (kBotW ? @"Mods load from top to bottom. Their game data (items, shops, flags, text) is merged; when two replace the same model or texture, the lower one wins. Tap Edit to change the order."
+                                                                    : @"Mods load from top to bottom: when two change the same file, the lower one wins. Tap Edit to change the order.")
                                                            : @"No mods yet. Import a mod folder, or put one in Mods in the Files app (On My iPad › the game).");
         for (NSString *name in mods) {
             NSDictionary *files = mod_files(name); unsigned long long bytes = 0;
@@ -973,7 +1029,7 @@ static TLForm *mods_form(void) {
             NSMutableArray *o = [installed_mods() mutableCopy]; NSString *m = o[(NSUInteger)from];
             [o removeObjectAtIndex:(NSUInteger)from]; [o insertObject:m atIndex:(NSUInteger)to]; [defs() setObject:o forKey:@"modsOrder"];
         };
-        TLSection *act = section(nil, kBotW ? @"RomFS mods (the mod's romfs folder) and BCML packages (.bnp, merged together when you press Play; tap one to choose its options). Code (exefs) mods do not apply to this port. Changing mods backs up your saves first when automatic backups are on."
+        TLSection *act = section(nil, kBotW ? @"RomFS mods (the mod's romfs folder) and BCML packages (.bnp; tap one to choose its options), merged together when you press Play. Code (exefs) mods do not apply to this port. Changing mods backs up your saves first when automatic backups are on."
                                             : @"RomFS mods only (the mod's romfs folder). Code (exefs) mods do not apply to this port. Changing mods backs up your saves first when automatic backups are on.");
         TLRow *imp = row(@"Import a mod folder…", nil); imp.symbol = @"square.and.arrow.down";
         imp.tapped = ^{ pick_folder(me, ^(NSURL *url) {
@@ -1023,7 +1079,7 @@ static TLForm *mods_form(void) {
                 [browse.rows addObject:link];
             }
             TLSection *compatibility = section(@"Supported downloads",
-                kBotW ? @"Switch RomFS files and BCML packages (.bnp). BCML packages are merged with UKMM's merger, so several of them can change the same game data (items, flags, text, maps); they may also replace add-on content files. RomFS mods load above them and overwrite whole files. Wii U/Cemu packs, UKMM packages, cheats and exefs code patches cannot be imported. Back up saves before trying a new mod."
+                kBotW ? @"Switch RomFS files and BCML packages (.bnp). Both are merged with UKMM's merger, so several mods can change the same game data (items, shops, flags, text, maps); for models and textures the lower mod in the list wins. BCML packages may also replace add-on content files. Wii U/Cemu packs, UKMM packages, cheats and exefs code patches cannot be imported. Back up saves before trying a new mod."
                       : @"Use Switch RomFS mods matching the game version shown above. Cheats, exefs code patches and emulator graphics mods are not supported. Mods that change the same file overwrite each other; this screen does not merge their contents. Some UI and heap files are reserved by this port and cannot be replaced by player mods. Back up saves before trying a new mod.");
             return @[list, act, browse, compatibility];
         }

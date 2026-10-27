@@ -1,6 +1,6 @@
-//! BCML (.bnp) mods for the Breath of the Wild port: UKMM converts a .bnp into a UKMM mod and merges the enabled mods
-//! into one RomFS layer, reading the vanilla files from the port's own RomFS images (runtime-index.bin + romfs.bin, or
-//! romfs.bin.000, .001, ... on the iPhone / iPad) instead of an unpacked dump. Called from the iOS launcher
+//! BCML (.bnp) mods for the Breath of the Wild port: UKMM converts a .bnp (or packs a RomFS mod folder) into a UKMM
+//! mod and merges the enabled mods into one RomFS layer, reading the vanilla files from the port's own RomFS images
+//! (runtime-index.bin + romfs.bin, or romfs.bin.000, .001, ... on the iPhone / iPad) instead of an unpacked dump. Called from the iOS launcher
 //! (launcher.m) through the C functions below; src/main.rs runs the same steps on the Mac for tests.
 //!
 //! GPL-3.0-or-later like UKMM (github.com/NiceneNerd/ukmm), which ios/tools/build_ukmm.py fetches at a pinned commit.
@@ -199,6 +199,51 @@ pub fn convert(bnp: &Path, base: &Path, aoc: Option<&Path>, work: &Path, lang: &
     Ok(serde_json::to_string(&meta)?)
 }
 
+/// Packs a RomFS mod folder (`romfs` holds files under the game's own paths) into the UKMM mod `out_zip` called `name`, so
+/// its edits to shared files (actor list, shop lists, game flags, texts) merge with other mods instead of replacing
+/// those files whole; returns its metadata as JSON.
+pub fn pack(romfs: &Path, name: &str, base: &Path, aoc: Option<&Path>, work: &Path, out_zip: &Path) -> Result<String> {
+    fn stage(from: &Path, to: &Path, top: bool) -> Result<()> {
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            let file = entry.file_name();
+            let file = file.to_string_lossy();
+            if file.starts_with('.') || (top && (file == "manifest.tsv" || file == "exefs")) {
+                continue;
+            }
+            let (src, dst) = (entry.path(), to.join(&*file));
+            if src.is_dir() {
+                fs::create_dir_all(&dst)?;
+                stage(&src, &dst, false)?;
+            } else if src.is_file() && fs::hard_link(&src, &dst).is_err() {
+                fs::copy(&src, &dst)?;
+            }
+        }
+        Ok(())
+    }
+    let staged = work.join("stage");
+    if staged.exists() {
+        fs::remove_dir_all(&staged)?;
+    }
+    let content = staged.join(platform_prefixes(Endian::Little).0);
+    fs::create_dir_all(&content)?;
+    stage(romfs, &content, true)?;
+    let meta: Meta = serde_json::from_value(serde_json::json!({
+        "name": name, "version": "", "author": "", "category": "Other", "description": "", "url": null,
+        "platform": {"Specific": "Switch"}, "option_groups": [], "masters": {},
+    }))?;
+    if let Some(parent) = out_zip.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let packed = uk_mod::pack::ModPacker::new(&staged, out_zip, Some(meta), vec![dump(base, aoc)?])
+        .and_then(|p| p.pack())
+        .with_context(|| format!("Failed to package {name}"));
+    fs::remove_dir_all(&staged)?;
+    packed?;
+    let meta: Meta = ModReader::open_peek(out_zip, vec![])?.meta;
+    Ok(serde_json::to_string(&meta)?)
+}
+
 #[derive(Deserialize)]
 struct MergeMod {
     path: PathBuf,
@@ -300,6 +345,18 @@ pub extern "C" fn totk_ukmm_convert(bnp: *const c_char, base: *const c_char, aoc
     run(move || {
         let (Some(bnp), Some(base), Some(work), Some(out_zip)) = (bnp, base, work, out_zip) else { bail!("Missing path") };
         convert(bnp.as_ref(), base.as_ref(), aoc.as_deref().map(Path::new), work.as_ref(), lang.as_deref().unwrap_or("USen"), out_zip.as_ref())
+    }, meta_json)
+}
+
+/// Packs a RomFS mod folder (see `pack`). Returns NULL on success with the metadata JSON in *meta_json (when not NULL),
+/// or an error message.
+#[unsafe(no_mangle)]
+pub extern "C" fn totk_ukmm_pack(mod_romfs: *const c_char, name: *const c_char, base: *const c_char, aoc: *const c_char,
+                                 work: *const c_char, out_zip: *const c_char, meta_json: *mut *mut c_char) -> *mut c_char {
+    let (mod_romfs, name, base, aoc, work, out_zip) = (c_str(mod_romfs), c_str(name), c_str(base), c_str(aoc), c_str(work), c_str(out_zip));
+    run(move || {
+        let (Some(mod_romfs), Some(name), Some(base), Some(work), Some(out_zip)) = (mod_romfs, name, base, work, out_zip) else { bail!("Missing path") };
+        pack(mod_romfs.as_ref(), &name, base.as_ref(), aoc.as_deref().map(Path::new), work.as_ref(), out_zip.as_ref())
     }, meta_json)
 }
 

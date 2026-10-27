@@ -1,6 +1,7 @@
 //! Mac test driver for the BCML / UKMM bridge (src/lib.rs):
 //!   ukmm-bridge convert <mod.bnp> <romfs dir> <aoc dir|-> <work dir> <out.zip>
 //!   ukmm-bridge merge <mods.json> <romfs dir> <aoc dir|-> <out dir>
+//!   ukmm-bridge pack <mod romfs dir> <name> <romfs dir> <aoc dir|-> <work dir> <out.zip>
 use std::path::Path;
 
 fn main() -> anyhow::Result<()> {
@@ -14,7 +15,10 @@ fn main() -> anyhow::Result<()> {
             totk_ukmm::merge(&std::fs::read_to_string(&a[2])?, a[3].as_ref(), aoc(&a[4]).as_deref(), "USen", a[5].as_ref())?;
             println!("merged into {}", a[5]);
         }
-        _ => anyhow::bail!("usage: ukmm-bridge convert <mod.bnp> <romfs> <aoc|-> <work> <out.zip> | merge <mods.json> <romfs> <aoc|-> <out>"),
+        Some("pack") if a.len() == 8 => {
+            println!("{}", totk_ukmm::pack(a[2].as_ref(), &a[3], a[4].as_ref(), aoc(&a[5]).as_deref(), a[6].as_ref(), a[7].as_ref())?);
+        }
+        _ => anyhow::bail!("usage: ukmm-bridge convert <mod.bnp> <romfs> <aoc|-> <work> <out.zip> | merge <mods.json> <romfs> <aoc|-> <out> | pack <mod romfs> <name> <romfs> <aoc|-> <work> <out.zip>"),
     }
     Ok(())
 }
