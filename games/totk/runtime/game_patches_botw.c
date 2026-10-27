@@ -540,6 +540,42 @@ static void patch_aspect(Module *m) {
     uint32_t bits; memcpy(&bits, &ratio, 4); atomic_store(botw_aspect_slot, bits);
     fprintf(stderr, "[botw] camera aspect %.5f (0 = original 16:9), three verified sites\n", ratio);
 }
+/* Invincibility (the cheat menu, runtime/botw_cheats.c). Refilling the hearts every frame does not survive one big hit: a
+   long fall ends in Game Over on landing. The player's damage step (main+0xf1c180, found with a hardware store watchpoint
+   on the life) works on a copy of the life, lets a full-health player survive a lethal hit with a quarter heart (falls
+   bypass that) and commits the copy with one store; a second path takes one quarter heart. While the data page's word
+   at +0xa0 is non-zero both stores keep the life the player had (w23 there, re-read in the second path):
+     main+0xf1c508  str w25, [x20]  -> b A:  adrp x8, <page> / ldr w8, [x8, #0xa0] / cbz w8, 1f / cmp w25, w23 /
+                                             csel w25, w23, w25, lt / 1: str w25, [x20] / b main+0xf1c50c
+     main+0xf1c2c0  str w8, [x20]   -> b B:  adrp x9, <page> / ldr w9, [x9, #0xa0] / cbz w9, 1f / ldr w8, [x20] /
+                                             1: str w8, [x20] / b main+0xf1c2c4
+   x8 / x9 and the flags are dead at both sites (x8 is reloaded at main+0xf1c50c, the flags are set again before their
+   next use). The stubs follow the camera-aspect stubs after the text. */
+static _Atomic(uint32_t) *botw_invincible_slot;
+void botw_invincible_set(int on);
+void botw_invincible_set(int on) { if (botw_invincible_slot) atomic_store(botw_invincible_slot, on != 0); }
+static void patch_invincible(Module *m) {
+    enum { FLAG = 0xa0, SITE_A = 0xf1c508, SITE_B = 0xf1c2c0 };
+    static const struct { uint32_t off, word; } check[] = {
+        {0xf1c504, 0xb9000bffu}, {SITE_A, 0xb9000299u}, {0xf1c50c, 0xf940a308u}, {0xf1c2bc, 0x1a88b3e8u}, {SITE_B, 0xb9000288u}, {0xf1c2c4, 0x1e220101u}};
+    uint64_t data = (m->file_size + 0x3fff) & ~0x3fffULL, a = ((m->text_end + 15) & ~15ULL) + 3 * 64, b = a + 64;   /* after the three aspect stubs */
+    if (b + 64 > ((m->text_end + 0x3fff) & ~0x3fffULL) || (m->ro_off && b + 64 > m->ro_off) || data + FLAG + 4 > m->size) runtime_fail("BotW invincibility patch area out of bounds");
+    for (size_t i = 0; !CODE_PATCHED_AT_BUILD && i < sizeof check / sizeof *check; i++) {
+        uint32_t w; memcpy(&w, m->base + check[i].off, 4);
+        if (w != check[i].word) { fprintf(stderr, "[botw] invincibility main+%#x: found %08x expected %08x\n", check[i].off, w, check[i].word); runtime_fail("invincibility requires the 1.6.0 player damage step"); }
+    }
+    for (unsigned j = 0; !CODE_PATCHED_AT_BUILD && j < 128; j++) if (m->base[a + j]) runtime_fail("BotW invincibility padding already in use");
+    const uint64_t page = (uintptr_t)m->base + data;
+    const uint32_t stub_a[] = {adrp_reg(8, (uintptr_t)m->base + a, page), ldr_w(8, 8, FLAG), 0x34000068u, 0x6b17033fu, 0x1a99b2f9u, 0xb9000299u, b_to(a + 24, SITE_A + 4)};
+    const uint32_t stub_b[] = {adrp_reg(9, (uintptr_t)m->base + b, page), ldr_w(9, 9, FLAG), 0x34000049u, 0xb9400288u, 0xb9000288u, b_to(b + 20, SITE_B + 4)};
+    for (unsigned j = 0; j < sizeof stub_a / sizeof *stub_a; j++) put_word(m, a + 4 * j, stub_a[j], "invincibility stub");
+    for (unsigned j = 0; j < sizeof stub_b / sizeof *stub_b; j++) put_word(m, b + 4 * j, stub_b[j], "invincibility stub");
+    put_word(m, SITE_A, b_to(SITE_A, a), "invincibility");
+    put_word(m, SITE_B, b_to(SITE_B, b), "invincibility");
+    botw_invincible_slot = (_Atomic(uint32_t) *)(void *)(m->base + data + FLAG);
+    atomic_store(botw_invincible_slot, 0);
+    fprintf(stderr, "[botw] invincibility: the player's damage step keeps the life while the cheat is on (2 verified sites)\n");
+}
 /* Diagnostic (Mac): TOTK_HEAP_LOG=1 logs every heap the game creates through its two create functions (ksys main+0x1a52160,
    sead main+0x125cd50): name, requested size (0: the rest of the parent), parent, and the heap made with its size (field 8). */
 static uint8_t *g_heaplog_main;   /* TOTK_HEAP_LOG (botw_heaplog_hook) */
@@ -548,6 +584,7 @@ void runtime_game_patches(Module *m) {
     fprintf(stderr, "[botw] %s game-code patches\n", TOTK_GAME_VERSION);
     patch_display(m);
     patch_aspect(m);
+    patch_invincible(m);
     if (code_switch("TOTK_HEAP_LOG")) { uint32_t b = 0xd4200000u | (0x7c1u << 5), was;
       for (int f = 0; f < 2; f++) { memcpy(&was, m->base + g_heaplog_fn[f].entry, 4);
         if (was != g_heaplog_fn[f].word) runtime_fail("heaplog: unexpected create function entry");
@@ -749,54 +786,3 @@ float runtime_aspect_now(void) {
     uint32_t bits = atomic_load(botw_aspect_slot); float ratio; memcpy(&ratio, &bits, 4); return ratio;
 }
 int runtime_aspect_toggle(void) { return 0; }
-
-/* Cheats chosen on the iOS start screen (launcher.m: never saved, so every launch starts with them off) or set in the
-   environment: TOTK_CHEAT_HEALTH, TOTK_CHEAT_STAMINA, TOTK_CHEAT_RUPEES, TOTK_CHEAT_ARROWS = 1. Applied at every
-   present like a cheat engine: the pointer chains of the community codes for BotW 1.6.0 (build 8e9978d50bdd20b4,
-   github.com/blawar/switchcheats). Every pointer is read with vm_read, so a chain that does not exist yet (title
-   screen, loading) writes nothing. Health and stamina refill to the player's own maximum (the codes wrote 30 hearts
-   and three stamina wheels whatever the save had); rupees and arrows are set to 999999 / 999 and stay in a save made
-   while the cheat is on, as on the console. TOTK_CHEAT_LOG=1 logs the values every 300 frames. */
-#include <mach/mach.h>
-uint8_t *runtime_module_base(const char *name);
-static int cheat_read(uint64_t a, void *out, size_t n) {
-    vm_size_t got = 0;
-    return a > 0x10000 && vm_read_overwrite(mach_task_self(), (vm_address_t)a, n, (vm_address_t)out, &got) == KERN_SUCCESS && got == n;
-}
-/* [main + base], then [p + chain[i]] for each link, then + add: the field's address, 0 when the chain is broken. */
-static uint64_t cheat_chain(const uint8_t *main, uint64_t base, const uint32_t *chain, int n, uint32_t add) {
-    uint64_t p;
-    if (!cheat_read((uint64_t)(uintptr_t)(main + base), &p, 8)) return 0;
-    for (int i = 0; i < n; i++) if (!p || !cheat_read(p + chain[i], &p, 8)) return 0;
-    uint32_t probe;
-    return p && cheat_read(p + add, &probe, 4) ? p + add : 0;
-}
-static int cheat_on(const char *name) { const char *e = getenv(name); return e && *e && strcmp(e, "0"); }
-void botw_cheats_tick(uint64_t frame) {
-    static int health = -1, stamina, rupees, arrows, logging;
-    if (health < 0) {
-        health = cheat_on("TOTK_CHEAT_HEALTH"); stamina = cheat_on("TOTK_CHEAT_STAMINA"); rupees = cheat_on("TOTK_CHEAT_RUPEES");
-        arrows = cheat_on("TOTK_CHEAT_ARROWS"); logging = cheat_on("TOTK_CHEAT_LOG");
-        if (health || stamina || rupees || arrows)
-            fprintf(stderr, "[cheats] on:%s%s%s%s\n", health ? " infinite health" : "", stamina ? " infinite stamina" : "", rupees ? " max rupees" : "", arrows ? " 999 arrows" : "");
-    }
-    if (!(health || stamina || rupees || arrows || logging)) return;
-    const uint8_t *main = runtime_module_base("main"); if (!main) return;
-    static const uint32_t c80[] = {0x80}, c38[] = {0x38}, crupee[] = {0xe40, 0x5b08}, carrow[] = {0x447e8};
-    uint64_t hp = cheat_chain(main, 0x2ca1a78, c80, 1, 0x848);      // current health, quarter hearts (one byte)
-    uint64_t player = cheat_chain(main, 0x2c9fd70, c38, 1, 0x2a8);  // +0: heart containers (float, quarter hearts), +4 / +8: stamina
-    uint64_t rp = cheat_chain(main, 0x2cc5fe0, crupee, 2, 0x5d90);  // rupees (s32)
-    uint64_t ar = cheat_chain(main, 0x2ca6d48, carrow, 1, 0x20);    // equipped arrows (s32; the menu shows it after reopening)
-    float maxhp = 0, st[2] = {0, 0}; uint8_t cur = 0; int32_t money = 0, quiver = 0;
-    if (player) { cheat_read(player, &maxhp, 4); cheat_read(player + 4, st, 8); }
-    if (hp) cheat_read(hp, &cur, 1);
-    if (rp) cheat_read(rp, &money, 4);
-    if (ar) cheat_read(ar, &quiver, 4);
-    if (logging && frame % 300 == 0)
-        fprintf(stderr, "[cheats] F%llu health %u/%g stamina %g %g rupees %d arrows %d (chains%s%s%s%s)\n", (unsigned long long)frame, cur, maxhp, st[0], st[1], money, quiver,
-                hp ? " hp" : "", player ? " player" : "", rp ? " rupees" : "", ar ? " arrows" : "");
-    if (health && hp && maxhp >= 4 && maxhp <= 120 && cur < (uint8_t)maxhp) { uint8_t v = (uint8_t)maxhp; memcpy((void *)(uintptr_t)hp, &v, 1); }
-    if (stamina && player && st[1] > 0 && st[1] <= 3000 && st[0] < st[1]) memcpy((void *)(uintptr_t)(player + 4), &st[1], 4);
-    if (rupees && rp && money != 999999) { int32_t v = 999999; memcpy((void *)(uintptr_t)rp, &v, 4); }
-    if (arrows && ar && quiver != 999) { int32_t v = 999; memcpy((void *)(uintptr_t)ar, &v, 4); }
-}

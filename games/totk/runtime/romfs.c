@@ -275,11 +275,13 @@ static unsigned mount_rom(const char *name,void *cache,uint64_t size) {
 }
 static unsigned cache_size(uint64_t *out) {if(!out)return INVALID;*out=0;return 0;}
 /* TOTK_FS_LOG=1: log every RomFS open with the time since start (shows how far the game gets without a picture). */
+static char text_lang[5];
 static void fs_log(const char *what,const char *path){static int on=-1;static uint64_t t0;if(on<0){on=getenv("TOTK_FS_LOG")!=NULL;t0=runtime_now_ns();}if(on)fprintf(stderr,"[totk-fs] %8.3f %s %s\n",(runtime_now_ns()-t0)/1e9,what,path);}
 void runtime_fs_log(const char *what,const char *path){fs_log(what,path);}
 unsigned runtime_romfs_open(uint64_t *out,const char *path,int mode) {
  fs_log("rom",path?path:"(null)");
  if(!out||mode!=1)return UNSUPPORTED;const char *p=rom_path(path);if(!p)return NOT_FOUND;uint64_t i=file_index(p);if(i==UINT64_MAX)return NOT_FOUND;
+ if(!strncmp(p,"Pack/Bootup_",12)&&strlen(p)==21&&!strcmp(p+16,".pack"))memcpy(text_lang,p+12,4);   /* Breath of the Wild's text pack (runtime_romfs_text_lang) */
  uint32_t ov=overlay_slot(i);int fd=-1;
  if(ov){const Overlay *o=&overlays[ov-1];fd=open(o->path,O_RDONLY|O_CLOEXEC);struct stat st;
   if(fd<0||fstat(fd,&st)!=0||(uint64_t)st.st_size!=o->size||st.st_dev!=o->dev||st.st_ino!=o->ino||st.st_mtimespec.tv_sec!=o->mtime.tv_sec||st.st_mtimespec.tv_nsec!=o->mtime.tv_nsec){
@@ -316,6 +318,18 @@ unsigned runtime_romfs_entry_type(int *out,const char *path) {
 int runtime_romfs_owns(const char *path) {size_t n=strlen(mount_name);return n&&path&&!strncmp(path,mount_name,n)&&path[n]==':';}
 int runtime_romfs_handle(uint64_t h) {return h>0x100000000ULL&&h<0x100000000ULL+NH;}
 unsigned runtime_romfs_read_options(uint64_t *out,uint64_t h,int64_t off,void *buf,uint64_t size) {return runtime_romfs_read(out,h,off,buf,size);}
+/* Breath of the Wild opens its text as Pack/Bootup_<language>.pack: that language ("USen", "EUfr", ...), "" before. */
+const char *runtime_romfs_text_lang(void) {return text_lang;}
+/* A whole file by its RomFS path without the mount ("Actor/ActorInfo.product.sbyml"), mods and added files included, in a
+   malloc'd buffer the caller frees; NULL when the game has not mounted the RomFS yet or the file is absent. The BotW cheat
+   menu reads its item list this way (runtime/botw_item_list.c). */
+uint8_t *runtime_romfs_load(const char *path,size_t *size) {
+ char full[4096];uint64_t h=0,n=0;int64_t total=0;
+ if(!*mount_name||snprintf(full,sizeof full,"%s:/%s",mount_name,path)>=(int)sizeof full||runtime_romfs_open(&h,full,1))return NULL;
+ uint8_t *data=NULL;
+ if(!runtime_romfs_size(&total,h)&&total>0&&(data=malloc((size_t)total))&&(runtime_romfs_read(&n,h,0,data,(uint64_t)total)||n!=(uint64_t)total)){free(data);data=NULL;}
+ runtime_romfs_close(h);if(data&&size)*size=(size_t)total;return data;
+}
 void *runtime_fs_override(const char *name) {
  static const struct{const char *name;void *fn;} map[]={
  {"_ZN2nn2fs8MountRomEPKcPvm",mount_rom},{"_ZN2nn2fs22QueryMountRomCacheSizeEPm",cache_size}};

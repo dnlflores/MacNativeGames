@@ -11393,6 +11393,9 @@ void mtl_exec(const uint8_t *p) {
 // ---------- 出图：交换链贴图画到 CAMetalLayer；可选截图 ----------
 // ---------- Present: draw the swapchain texture to the CAMetalLayer; optional screenshot ----------
 static id<MTLRenderPipelineState> g_blit_pso; static MTLPixelFormat g_blit_fmt;
+#ifdef GAME_BOTW
+static id<MTLRenderPipelineState> g_blend_pso;   // the blit with premultiplied-alpha blending: the cheat menu over the picture
+#endif
 static id<MTLSamplerState> g_blit_samp;
 static uint64_t g_present_n;
 uint64_t mtl_present_count(void) { return g_present_n; }   // 实际出图次数（发热归因 DM_HEAT 算出图帧率） | Actual present count (heat attribution DM_HEAT computes the present frame rate)
@@ -11865,6 +11868,14 @@ static void present_pipeline(MTLPixelFormat format) {
         pd.colorAttachments[0].pixelFormat = format;
         g_blit_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
         if (!g_blit_pso) MDIE("出图管线失败 %s", e.localizedDescription.UTF8String);
+#ifdef GAME_BOTW
+        MTLRenderPipelineColorAttachmentDescriptor *c = pd.colorAttachments[0];
+        c.blendingEnabled = YES; c.rgbBlendOperation = c.alphaBlendOperation = MTLBlendOperationAdd;
+        c.sourceRGBBlendFactor = c.sourceAlphaBlendFactor = MTLBlendFactorOne;
+        c.destinationRGBBlendFactor = c.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        g_blend_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        if (!g_blend_pso) MDIE("cheat menu blend pipeline: %s", e.localizedDescription.UTF8String);
+#endif
         g_blit_fmt = format;
         MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear; sd.supportArgumentBuffers = YES;
         g_blit_samp = [g_dev newSamplerStateWithDescriptor:sd];
@@ -11958,6 +11969,44 @@ static int load_overlay_prepare(int slot, MTLViewport vp, MTLViewport *ovp, floa
     memcpy(uv, u, sizeof u);
     return 1;
 }
+#ifdef GAME_BOTW
+/* Breath of the Wild's in-game cheat menu (runtime/botw_cheats.c, open with L + R + A): premultiplied BGRA8 pixels drawn
+   with g_blend_pso at the left of the game picture. Per present slot a texture of the first panel's size (created when the
+   menu first opens, resident before its first use) and the version of the pixels it holds. */
+int botw_cheat_overlay(int view_w, int view_h, int max_w, int max_h, const uint8_t **pixels, int *w, int *h, int *x, int *y, uint64_t *version);
+static id<MTLTexture> g_cheat_tex[4]; static id<MTLBuffer> g_cheat_uv[4]; static uint64_t g_cheat_ver[4]; static int g_cheat_w, g_cheat_h;
+static int cheat_overlay_prepare(int slot, MTLViewport vp, MTLViewport *ovp, float uv[8]) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    if (slot < 0 || slot > 3 || !g_blend_pso) return 0;
+    pthread_mutex_lock(&mu);
+    const uint8_t *px; int w, h, x, y; uint64_t ver;
+    if (!botw_cheat_overlay((int)lround(vp.width), (int)lround(vp.height), g_cheat_w ? g_cheat_w : 4096, g_cheat_h ? g_cheat_h : 4096, &px, &w, &h, &x, &y, &ver)) { pthread_mutex_unlock(&mu); return 0; }
+    if (!g_cheat_tex[0]) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:(NSUInteger)w height:(NSUInteger)h mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead; d.storageMode = MTLStorageModeShared;
+        for (int i = 0; i < 4; i++) {
+            g_cheat_tex[i] = [g_dev newTextureWithDescriptor:d];
+            g_cheat_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared];
+            if (!g_cheat_tex[i] || !g_cheat_uv[i]) MDIE("cheat menu texture %d", i);
+            res_add(g_cheat_tex[i]); res_add(g_cheat_uv[i]);
+        }
+        res_commit();   // resident before this present's command buffer runs
+        g_cheat_w = w; g_cheat_h = h;
+        MLOG("[cheats] menu panel %dx%d for a %.0fx%.0f picture", w, h, vp.width, vp.height);
+    }
+    if (w > g_cheat_w || h > g_cheat_h) { pthread_mutex_unlock(&mu); return 0; }
+    if (g_cheat_ver[slot] != ver + 1) {
+        [g_cheat_tex[slot] replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)w, (NSUInteger)h) mipmapLevel:0 withBytes:px bytesPerRow:(NSUInteger)w * 4];
+        g_cheat_ver[slot] = ver + 1;
+    }
+    pthread_mutex_unlock(&mu);
+    float W = g_cheat_w, H = g_cheat_h;
+    *ovp = (MTLViewport){vp.originX + x, vp.originY + y, w, h, 0, 1};
+    const float u[8] = {0, 0, w / W, h / H, 0.5f / W, 0.5f / H, (w - 0.5f) / W, (h - 0.5f) / H};
+    memcpy(uv, u, sizeof u);
+    return 1;
+}
+#endif
 /* TOTK 2K output (user, 2026-10-16 night: "2K output with MetalFX"): when the window or the full screen shows the game
    picture bigger than it is (the 1920x1080 picture at 2560x1440 full screen on the user's 3440x1440 display), MetalFX
    upscales it to the viewport (perceptual: display values) and the present draws the result 1:1, instead of the bilinear
@@ -12061,6 +12110,12 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
         [en setViewport:ovp]; [en setFragmentTexture:g_load_tex[3] atIndex:0]; [en setFragmentBytes:fuv length:sizeof fuv atIndex:0];
         [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
+#ifdef GAME_BOTW
+    if (fps_overlay && cheat_overlay_prepare(3, vp, &ovp, fuv)) {   // the cheat menu, blended over everything
+        [en setViewport:ovp]; [en setRenderPipelineState:g_blend_pso]; [en setFragmentTexture:g_cheat_tex[3] atIndex:0]; [en setFragmentBytes:fuv length:sizeof fuv atIndex:0];
+        [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    }
+#endif
     [en endEncoding];
     return 1;
 }
@@ -12122,6 +12177,15 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
         [en setViewport:ovp];
         [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
+#ifdef GAME_BOTW
+    if (cheat_overlay_prepare(uv_i, vp, &ovp, fuv)) {   // the cheat menu, blended over everything
+        memcpy(g_cheat_uv[uv_i].contents, fuv, sizeof fuv);
+        [args setTexture:g_cheat_tex[uv_i].gpuResourceID atIndex:0];
+        [args setAddress:g_cheat_uv[uv_i].gpuAddress atIndex:0];
+        [en setViewport:ovp]; [en setRenderPipelineState:g_blend_pso];
+        [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    }
+#endif
     m4_end(en);
     return 1;
 }

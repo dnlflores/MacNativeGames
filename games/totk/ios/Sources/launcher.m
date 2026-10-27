@@ -516,12 +516,13 @@ static NSString *link_layer(NSDictionary<NSString *, NSString *> *pick, NSString
 
 // ---------- cheats (Breath of the Wild) ----------
 /* Kept in memory only, never in the user defaults: every launch of the app starts with all cheats off. The game applies
-   them at every frame (runtime/game_patches_botw.c botw_cheats_tick). */
+   them at every frame (runtime/botw_cheats.c), and its cheat menu (hold L and R, press A) switches them while playing. */
 static NSMutableSet<NSString *> *g_cheats;
 static NSArray<NSArray<NSString *> *> *cheat_options(void) {   // environment variable, title, detail
     return @[
-        @[@"TOTK_CHEAT_HEALTH", @"Infinite health", @"Hearts refill to full: Link cannot die"],
-        @[@"TOTK_CHEAT_STAMINA", @"Infinite stamina", @"The stamina wheel stays full while climbing, sprinting and swimming"],
+        @[@"TOTK_CHEAT_HEALTH", @"Invincibility", @"Damage never takes hearts away, long falls included, and hearts stay full"],
+        @[@"TOTK_CHEAT_STAMINA", @"Unlimited stamina", @"The stamina wheel stays full while climbing, sprinting and swimming"],
+        @[@"TOTK_CHEAT_MOONJUMP", @"Moon jump", @"Hold L, then hold X: Link jumps and keeps rising while both are held. With it on, L (runes) acts when you let go of it"],
         @[@"TOTK_CHEAT_RUPEES", @"Max rupees", @"999,999 rupees. A save made while it is on keeps them"],
         @[@"TOTK_CHEAT_ARROWS", @"999 arrows", @"The equipped arrows stay at 999 (the inventory shows it after reopening). A save keeps them"],
     ];
@@ -909,7 +910,7 @@ static TLForm *enhancements_form(void) {
 static TLForm *cheats_form(void) {
     return [[TLForm alloc] initWithTitle:@"Cheats" build:^NSArray<TLSection *> *(TLForm *me) {
         (void)me;
-        TLSection *list = section(nil, @"Cheats turn off every time the app restarts. Health and stamina never change your heart containers or stamina wheels.");
+        TLSection *list = section(nil, @"In the game, hold L and R and press A for the cheat menu: it switches these while you play and drops weapons, bows, shields, arrows, food, materials, critters and rupees in front of Link. Cheats turn off every time the app restarts. Health and stamina never change your heart containers or stamina wheels.");
         for (NSArray<NSString *> *o in cheat_options()) {
             TLRow *r = row(o[1], o[2]); r.isSwitch = YES; r.on = [cheats() containsObject:o[0]];
             r.toggled = ^(BOOL on) { if (on) [cheats() addObject:o[0]]; else [cheats() removeObject:o[0]]; };
@@ -1202,7 +1203,7 @@ static UIColor *gold(void) { return [UIColor colorWithRed:0.89 green:0.76 blue:0
     ];
     if (!kBotW) return base;
     NSUInteger nc = cheats().count;
-    return [base arrayByAddingObject:@[@"wand.and.stars", @"Cheats", nc ? [NSString stringWithFormat:@"%lu on · off after a restart", (unsigned long)nc] : @"All off"]];
+    return [base arrayByAddingObject:@[@"wand.and.stars", @"Cheats", nc ? [NSString stringWithFormat:@"%lu on · off after a restart", (unsigned long)nc] : @"All off · L + R + A in the game"]];
 }
 - (void)refresh {
     NSArray *it = [self items];
