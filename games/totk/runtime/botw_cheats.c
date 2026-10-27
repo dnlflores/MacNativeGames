@@ -1,8 +1,8 @@
 /* Breath of the Wild cheats (botw_cheats.h): the cheats chosen on the iOS start screen (launcher.m: never saved, so every
    launch starts with them off) or set in the environment, TOTK_CHEAT_HEALTH (invincibility), TOTK_CHEAT_STAMINA,
-   TOTK_CHEAT_MOONJUMP, TOTK_CHEAT_RUPEES, TOTK_CHEAT_ARROWS = 1, and the in-game cheat menu: hold L and R and press A.
-   The menu switches the same cheats while the game runs and drops weapons, bows, shields, arrows, food, materials,
-   critters and rupees in front of Link; the game's controller input is held back while it is open.
+   TOTK_CHEAT_MOONJUMP, TOTK_CHEAT_RUPEES, TOTK_CHEAT_ARROWS, TOTK_CHEAT_TILT = 1, and the in-game cheat menu: hold L
+   and R and press A. The menu switches the same cheats while the game runs and drops weapons, bows, shields, arrows,
+   food, materials, critters and rupees in front of Link; the game's controller input is held back while it is open.
 
    Everything goes through the game's own data and functions (BotW 1.6.0, build 8e9978d50bdd20b4; offsets from main):
    - invincibility: the player's damage step keeps the life it had (a code patch reading a flag on the loader's data page,
@@ -11,6 +11,9 @@
      with vm_read so nothing is written before a chain exists (title screen, loading). Health and stamina refill to the
      player's own maximum at every present and every controller read; rupees and arrows are set to 999999 / 999 and stay
      in a save made while they are on, as on the console.
+   - stick tilt (for the motion-control shrines, such as Myahm Agana's maze, with a controller that has no motion
+     sensors): the left stick tilts a virtual controller up to 45 degrees from lying face up, which the game reads as its
+     six-axis sensor (runtime_motion_virtual, runtime/hid_feedback.c), and the game sees the stick centred.
    - moon jump: the player's gravity factor ([[[main+0x2d1ea00]+0x198]+0x2d18]+0x130, or the same object by
      [[main+0x2c99e10]+0x8f40]; 1.0 as shipped; the community "Moonjump" codes) is -1 while L and X are both held. It only
      acts in the air, so the X press jumps first.
@@ -57,13 +60,14 @@ static uint64_t cheat_chain(const uint8_t *main, uint64_t base, const uint32_t *
 static const uint8_t *game_main(void) { return runtime_module_base("main"); }
 
 // ---------- the cheats ----------
-enum { CHEAT_INVINCIBLE, CHEAT_STAMINA, CHEAT_MOON_JUMP, CHEAT_RUPEES, CHEAT_ARROWS, CHEATS };
+enum { CHEAT_INVINCIBLE, CHEAT_STAMINA, CHEAT_MOON_JUMP, CHEAT_RUPEES, CHEAT_ARROWS, CHEAT_TILT, CHEATS };
 static const struct { const char *env, *title, *detail; } cheat_info[CHEATS] = {
     {"TOTK_CHEAT_HEALTH", "Invincibility", "Hearts stay full"},
     {"TOTK_CHEAT_STAMINA", "Unlimited stamina", "The stamina wheel stays full"},
     {"TOTK_CHEAT_MOONJUMP", "Moon jump", "Hold L, then hold X to rise"},
     {"TOTK_CHEAT_RUPEES", "Max rupees", "999,999 rupees"},
     {"TOTK_CHEAT_ARROWS", "999 arrows", "The equipped arrows stay at 999"},
+    {"TOTK_CHEAT_TILT", "Tilt with the left stick", "Gyro puzzles; Link won't walk"},
 };
 static _Atomic int g_cheat[CHEATS], g_log;
 void botw_invincible_set(int on);   /* game_patches_botw.c: the damage step keeps the life while on */
@@ -130,6 +134,23 @@ static void moon_jump(const uint8_t *main, int rise) {
     if (cheat_read(g, &now, 4) && now != v) memcpy((void *)(uintptr_t)g, &v, 4);
     if (rise != rising) fprintf(stderr, "[cheats] moon jump %s\n", rise ? "rising" : "released");
     rising = rise;
+}
+
+/* Stick tilt: the left stick's direction tips the virtual controller's far edge (up) or a side down, up to 45 degrees,
+   turning at most 180 degrees a second, so a flick does not throw the maze's ball through a wall. Called at every
+   controller read while it is on (the samples stop when it is off: no motion, as before); off resets it to level. */
+static void stick_tilt(int on, int32_t lx, int32_t ly, uint64_t now) {
+    static double pitch, roll; static uint64_t last, logged;
+    if (!on) { pitch = roll = 0; last = 0; return; }
+    const double most = 45 * M_PI / 180, dead = 0.1;
+    double x = lx / 32767.0, y = ly / 32767.0, r = sqrt(x * x + y * y), k = r > dead ? fmin(1, (r - dead) / (1 - dead)) / r : 0;
+    double want_pitch = -y * k * most, want_roll = x * k * most, step = last ? fmin(now - last, 100000000ull) / 1e9 * M_PI : 0;
+    pitch += fmax(-step, fmin(step, want_pitch - pitch)); roll += fmax(-step, fmin(step, want_roll - roll));
+    last = now;
+    runtime_motion_virtual(pitch, roll, now);
+    if ((pitch || roll) && now - logged > 1000000000ull) {
+        logged = now; fprintf(stderr, "[cheats] tilt: far edge %+.0f, right side %+.0f degrees down\n", -pitch * 180 / M_PI, roll * 180 / M_PI);
+    }
 }
 
 // ---------- dropping items ----------
@@ -231,6 +252,7 @@ static void menu_activate(Menu *m, int five) {
             fprintf(stderr, "[cheats] %s %s\n", cheat_info[m->row].title, on ? "on" : "off");
             if (m->row == CHEAT_INVINCIBLE) botw_invincible_set(on);
             if (m->row == CHEAT_MOON_JUMP && !on) { const uint8_t *main = game_main(); if (main) moon_jump(main, 0); }
+            if (m->row == CHEAT_TILT && !on) stick_tilt(0, 0, 0, 0);
             return;
         }
         items_start();
@@ -301,6 +323,7 @@ void botw_cheat_input(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, 
         pthread_mutex_unlock(&g_menu_mu);
         *buttons = 0; *lx = *ly = *rx = *ry = 0;
         if (main) moon_jump(main, 0);
+        if (atomic_load(&g_cheat[CHEAT_TILT])) stick_tilt(1, 0, 0, now);
         return;
     }
     int moon_on = atomic_load(&g_cheat[CHEAT_MOON_JUMP]);
@@ -330,6 +353,7 @@ void botw_cheat_input(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, 
         if (now < in.tap_until[s]) game |= bit;
     }
     *buttons = game;
+    if (atomic_load(&g_cheat[CHEAT_TILT])) { stick_tilt(1, *lx, *ly, now); *lx = *ly = 0; }
     if (main) {
         moon_jump(main, moon_on && in.moon && (phys & PAD_L) && (phys & PAD_X));
         refill(main);

@@ -910,7 +910,7 @@ static TLForm *enhancements_form(void) {
 static TLForm *cheats_form(void) {
     return [[TLForm alloc] initWithTitle:@"Cheats" build:^NSArray<TLSection *> *(TLForm *me) {
         (void)me;
-        TLSection *list = section(nil, @"In the game, hold L and R and press A for the cheat menu: it switches these while you play and drops weapons, bows, shields, arrows, food, materials, critters and rupees in front of Link. Cheats turn off every time the app restarts. Health and stamina never change your heart containers or stamina wheels.");
+        TLSection *list = section(nil, @"In the game, hold L and R and press A for the cheat menu: it switches these while you play and drops weapons, bows, shields, arrows, food, materials, critters and rupees in front of Link. For shrines that need motion controls, its \"Tilt with the left stick\" makes the left stick tilt the platform. Cheats turn off every time the app restarts. Health and stamina never change your heart containers or stamina wheels.");
         for (NSArray<NSString *> *o in cheat_options()) {
             TLRow *r = row(o[1], o[2]); r.isSwitch = YES; r.on = [cheats() containsObject:o[0]];
             r.toggled = ^(BOOL on) { if (on) [cheats() addObject:o[0]]; else [cheats() removeObject:o[0]]; };

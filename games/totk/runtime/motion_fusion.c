@@ -32,6 +32,7 @@ static int from[3] = {0, 1, 2};
 static double sign[3] = {1, 1, 1}, det = 1;
 static double deadzone = -1;   /* rad/s; -1 until read from TOTK_GYRO_DEADZONE */
 static double deadzone_default;   /* deg/s, when TOTK_GYRO_DEADZONE is unset */
+static uint64_t virtual_ns;       /* the last virtual sample (runtime_motion_virtual) */
 
 /* TOTK_GYRO_AXES: reference axis i = sign * controller axis from[i]. 0 if unset, -1 if malformed. */
 int runtime_motion_axes(const char *spec) {
@@ -95,6 +96,7 @@ static void integrate(const double gyro[3], const double acc[3], double dt) {
 void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint64_t now) {
     double acc[3], gyro[3];
     pthread_mutex_lock(&lock);
+    if (virtual_ns && now - virtual_ns < 200000000ull) { pthread_mutex_unlock(&lock); return; }   /* the virtual controller has the sensor */
     for (int i = 0; i < 3; i++) { acc[i] = sign[i] * raw_acc[from[i]]; gyro[i] = det * sign[i] * raw_gyro[from[i]]; }
     if (deadzone < 0) {
         const char *e = getenv("TOTK_GYRO_DEADZONE"); double v = deadzone_default;
@@ -125,6 +127,36 @@ void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint
                 s->acc[0], s->acc[1], s->acc[2], s->gyro[0], s->gyro[1], s->gyro[2]);
         logged = produced; reads_logged = reads; log_at = now;
     }
+    pthread_mutex_unlock(&lock);
+}
+/* A virtual controller for one without motion sensors (2026-10-27; runtime/botw_cheats.c tilts it with a stick for the
+   motion-control shrines). Its orientation is given: lying face up, turned by pitch about its x axis (positive raises the
+   top edge), then by roll about its own y axis (positive lowers the right side), in radians. Each call is one sample:
+   the rotation since the previous call as the rate, and the gravity the tilted controller measures. While they keep
+   coming (200 ms), a real controller's samples are dropped; it starts over from its own gravity afterwards. */
+void runtime_motion_virtual(double pitch, double roll, uint64_t now) {
+    const double cp = cos(pitch), sp = sin(pitch), cr = cos(roll), sr = sin(roll);
+    const double next[3][3] = {{cr, 0, sr}, {sp * sr, cp, -sp * cr}, {-cp * sr, sp, cp * cr}};   /* Rx(pitch) Ry(roll) */
+    double w[3] = {0, 0, 0}, dt = 0.004;
+    pthread_mutex_lock(&lock);
+    if (virtual_ns && now > virtual_ns && now - virtual_ns < 200000000ull) {   /* the body-frame turn E = R^T next */
+        double E[3][3];
+        dt = (now - virtual_ns) / 1e9;
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) E[i][j] = R[0][i] * next[0][j] + R[1][i] * next[1][j] + R[2][i] * next[2][j];
+        double v[3] = {(E[2][1] - E[1][2]) / 2, (E[0][2] - E[2][0]) / 2, (E[1][0] - E[0][1]) / 2}, s = norm3(v);
+        double c = (E[0][0] + E[1][1] + E[2][2] - 1) / 2, theta = atan2(s, c < -1 ? -1 : c > 1 ? 1 : c);
+        for (int i = 0; i < 3; i++) w[i] = (s > 1e-12 ? v[i] * theta / s : v[i]) / dt;
+    } else memset(angle, 0, sizeof angle);   /* starting: no turn in the first sample */
+    memcpy(R, next, sizeof R);
+    virtual_ns = last_ns = now; live = 1; restart = 1;
+    RuntimeMotionState *s = &ring[produced % MOTION_RING];
+    *s = (RuntimeMotionState){.sampling = produced + 1, .delta_ns = (uint64_t)(dt * 1e9)};
+    for (int i = 0; i < 3; i++) {
+        double rps = w[i] / (2 * M_PI); angle[i] += rps * dt;
+        s->acc[i] = (float)-R[2][i]; s->gyro[i] = (float)rps; s->angle[i] = (float)angle[i];
+        for (int j = 0; j < 3; j++) s->dir[i * 3 + j] = (float)R[j][i];
+    }
+    produced++;
     pthread_mutex_unlock(&lock);
 }
 int runtime_motion_read(RuntimeMotionState *out, int max) {

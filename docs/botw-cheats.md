@@ -22,6 +22,11 @@ On a Mac keyboard L, R and A are Q, E and J.
 - **Moon jump**: hold L, then hold X. Link jumps and rises as long as both are held; let go and he falls (press X to
   open the paraglider). While moon jump is on, L (runes) acts when you let go of it, so that L + X never uses a rune.
 - **Max rupees** (999,999) and **999 arrows** (the equipped arrows): a save made while they are on keeps them.
+- **Tilt with the left stick**: for the motion-control shrines (Myahm Agana's ball maze and the other "tilt the
+  controller" puzzles) with a controller that has no motion sensors, such as a Backbone. At the pedestal, press A as
+  usual, then switch this on: the left stick tilts the platform up to 45 degrees (up tips the far edge down, right the
+  right side) and it levels again when you let go. B leaves the pedestal as usual. While it is on, Link does not walk,
+  so switch it off again afterwards.
 - **Drop in front of Link**: one-handed and two-handed weapons, spears, bows, shields, arrow bundles, food and ingredients,
   monster parts and gems, critters and rupees. They land two metres in front of Link and are picked up as usual
   (a few, such as the Bow of Light, go straight into the inventory). The list comes from the game's own files, mods
@@ -32,9 +37,10 @@ restarts; nothing is saved. The first L or R press reaches the game 90 ms late (
 from a single one); a press shorter than that still arrives as a tap.
 
 Environment variables (a launch's own variables win over the start screen): `TOTK_CHEAT_HEALTH` (invincibility),
-`TOTK_CHEAT_STAMINA`, `TOTK_CHEAT_MOONJUMP`, `TOTK_CHEAT_RUPEES`, `TOTK_CHEAT_ARROWS` = 1; `TOTK_CHEAT_LOG=1` logs the
+`TOTK_CHEAT_STAMINA`, `TOTK_CHEAT_MOONJUMP`, `TOTK_CHEAT_RUPEES`, `TOTK_CHEAT_ARROWS`, `TOTK_CHEAT_TILT` = 1; `TOTK_CHEAT_LOG=1` logs the
 values every 300 frames. The log shows `[cheats] menu opened`, `[cheats] item list: N items ...` and one
-`[cheats] dropped <actor> xN` line per drop.
+`[cheats] dropped <actor> xN` line per drop, and `[cheats] tilt: far edge ..., right side ... degrees down` at most once a
+second while the stick tilts.
 
 ## How it works
 
@@ -56,5 +62,11 @@ Everything goes through the game's own data and functions in 1.6.0 (build `8e997
   (`+0xa0`), so the iOS executable stays as exported and the cheat can be switched while playing.
 - **Moon jump**: the player's gravity factor (1.0 as shipped) is -1 while L and X are held, the community "Moonjump"
   code's field. It acts only in the air, which is why X jumps first.
+- **Stick tilt**: the game reads the controller's six-axis sensor through `runtime/hid_feedback.c`; with no motion
+  sensors it gets a still, unconnected controller, and the gyro pedestal (`SwitchGyroTilt`) never moves the maze. The
+  stick sets the orientation of a virtual controller (`runtime_motion_virtual` in `runtime/motion_fusion.c`: lying face
+  up, turned about its x and y axes, at most 180 degrees a second); each controller read is one sample with the matching
+  gravity, rotation rate and direction, exactly what a tilted Pro Controller reports. Real motion samples are dropped
+  while it is in use. `scripts/input_probe.c` checks the samples.
 - **Drawing**: the menu is drawn with Core Text into a premultiplied BGRA texture when it changes and blended over the
   picture at present (`gfx/nvn/nvn_mtl.m`, both present paths), so it shows in window captures (`wshot`) as well.

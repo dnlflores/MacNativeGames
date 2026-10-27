@@ -127,6 +127,18 @@ static void feedback_checks(void){
  need(runtime_hid_feedback_flag("gyro",1)==1&&!sstates(&n,buf.s,16,&six)&&n==16&&buf.s[0].attr==1,"flag gyro 1: motion again");
  probe_now+=300000000;need(!sstates(&n,buf.s,16,&six)&&n==1&&buf.s[0].attr==0,"no sample for 300 ms: no motion");
  feed(1,0,0,-1,0,0,0);runtime_motion_live(0);need(!sstates(&n,buf.s,16,&six)&&n==1&&buf.s[0].attr==0,"controller detached: no motion");
+ /* A virtual controller (runtime_motion_virtual: a stick tilts it): face up, then pitched up 30 degrees 0.1 s later (top
+    edge up: gravity toward the bottom edge, y axis rising, 1/12 turn at 0.833 rev/s about x), then rolled 90 degrees
+    (right side down: gravity along +x, x axis pointing down). A real sample meanwhile is dropped; 300 ms later, no motion. */
+ probe_now+=1000000000;runtime_motion_virtual(0,0,probe_now);sstates(&n,buf.s,16,&six);
+ need(buf.s[0].attr==1&&near3(buf.s[0].acc,0,0,-1,1e-6)&&near3(buf.s[0].dir,1,0,0,1e-6)&&near3(buf.s[0].dir+6,0,0,1,1e-6)&&near3(buf.s[0].gyro,0,0,0,0),"virtual controller: starts face up, connected, not turning");
+ probe_now+=100000000;runtime_motion_virtual(M_PI/6,0,probe_now);sstates(&n,buf.s,16,&six);
+ need(near3(buf.s[0].acc,0,-0.5,-0.8660254,1e-5)&&near3(buf.s[0].dir+3,0,0.8660254,0.5,1e-5)&&near3(buf.s[0].gyro,1/1.2,0,0,1e-4)&&near3(buf.s[0].angle,1/12.0,0,0,1e-5)&&buf.s[0].dt==100000000,"virtual pitch: gravity, axes, rate and angle");
+ probe_now+=100000000;runtime_motion_virtual(0,M_PI/2,probe_now);sstates(&n,buf.s,16,&six);
+ need(near3(buf.s[0].acc,1,0,0,1e-5)&&near3(buf.s[0].dir,0,0,-1,1e-5)&&near3(buf.s[0].dir+3,0,1,0,1e-5),"virtual roll: right side down");
+ runtime_motion_live(1);feed(1,0,-1,0,0,0,0);sstates(&n,buf.s,16,&six);need(near3(buf.s[0].acc,1,0,0,1e-5),"real samples dropped while the virtual controller is in use");
+ probe_now+=300000000;need(!sstates(&n,buf.s,16,&six)&&n==1&&buf.s[0].attr==0,"virtual samples stopped: no motion");
+ feed(1,0,0,-1,0,0,0);sstates(&n,buf.s,1,&six);need(buf.s[0].attr==1&&near3(buf.s[0].dir+6,0,0,1,1e-6),"a real controller again, from its own gravity");
  probe_clock_fixed=0;
 }
 int main(void){
@@ -172,5 +184,5 @@ int main(void){
  runtime_input_key(38,1);runtime_input_key(38,0);need(hread(&out.state,1,&hid)==1&&out.state.buttons==1&&out.state.attr==1,"handheld short tap latched");
  read(&out.state,1,&id);need(!out.state.attr&&!out.state.buttons,"handheld mode: player 1 not attached");
  feedback_checks();
- puts("{\"status\":\"pass\",\"scope\":\"input service state ABI, rumble and six-axis hid answers (on by default, off with =0 and in agent test sessions, left/right handles, batches, mute flags, newest-first states, orientation in the controller frame, gravity pull, axis remap), short tap latch, keyboard axes, four D-pad directions, focus clear of keyboard and controller, key 1 overlays / key 2 frame interpolation / key 3 picture mode / key 4 ultrawide / key 5 edge smoothing (once per press), unattached controller, handheld mode controller; no game control flow\"}");
+ puts("{\"status\":\"pass\",\"scope\":\"input service state ABI, rumble and six-axis hid answers (on by default, off with =0 and in agent test sessions, left/right handles, batches, mute flags, newest-first states, orientation in the controller frame, gravity pull, axis remap, a virtual controller tilted by a stick), short tap latch, keyboard axes, four D-pad directions, focus clear of keyboard and controller, key 1 overlays / key 2 frame interpolation / key 3 picture mode / key 4 ultrawide / key 5 edge smoothing (once per press), unattached controller, handheld mode controller; no game control flow\"}");
 }
