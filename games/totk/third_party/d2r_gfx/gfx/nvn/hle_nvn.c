@@ -2557,6 +2557,11 @@ static void tsummary(uint64_t frame) {
           if (pf && frame > pf && v[0] > pk[0]) LOG("[nvn] GPU 保活 至帧 %llu：每帧 %.2f 个自旋核，平均 %.2f ms，最长 %.2f ms", frame, (double)(v[0] - pk[0]) / (double)(frame - pf),
               (double)(v[1] - pk[1]) / 1e3 / (double)(v[0] - pk[0]), (double)v[2] / 1e3);
           pk[0] = v[0]; pk[1] = v[1]; }
+        { static uint64_t pq[2]; uint64_t v[5]; void mtl_gpu_probe_stats(uint64_t[5]); mtl_gpu_probe_stats(v);   // TOTK: GPU clock probe (nvn_mtl.m keepalive_start)
+          if (v[0] > pq[0]) { double mean = (double)(v[1] - pq[1]) / (double)(v[0] - pq[0]) / 1e3;
+            LOG("[nvn] GPU clock probe to frame %llu: %llu runs of the fixed kernel, fastest %.3f / mean %.3f / slowest %.3f ms; the session's fastest %.3f ms, so the clock was about %.0f%% of that", frame,
+                (unsigned long long)(v[0] - pq[0]), v[2] / 1e3, mean, v[3] / 1e3, v[4] / 1e3, mean > 0 ? 100 * v[4] / 1e3 / mean : 0); }
+          pq[0] = v[0]; pq[1] = v[1]; }
         { static uint64_t pl[4]; uint64_t v[4]; void mtl_layer_stats(uint64_t[4]); mtl_layer_stats(v);   // TOTK: layered passes (nvn_mtl.m g_lay)
           if (pf && frame > pf) { double nf = (double)(frame - pf);
             LOG("[nvn] 渲染通道 至帧 %llu：每帧 %.1f 个，其中分层通道 %.2f 个，并入的设目标 %.2f 次，因绘制不能写层号退回 %.2f 次", frame,
@@ -2798,6 +2803,53 @@ static void present_exec(win_t *o, int idx, double period, const int crop[4], ui
     if (frame) mtl_set_frame(frame);
     gfx_leave();
 }
+/* TOTK_PASS_GPU_AUTO=<ms> (iPhone / iPad default 20, Mac 0 = off): when the frames' GPU time stays above that (a 48-frame
+   mean, after the first 600 frames), the per-encoder GPU profile of the next 2 frames goes to the log (TOTK_PASS_GPU's
+   report, nvn_mtl.m), at most once every 30 s and 20 times a run; one profile of a light stretch (1/3 to 2/3 of it) comes
+   first, to compare with. For slowdowns that only happen on the device (Temple of Time, 2026-10-27: 21-28 ms on the
+   iPad, 5-6 ms on the Mac). */
+void dm_gfx_set_flag(const char *name, int v);
+static void pass_gpu_auto(double g) {
+    static double limit = -1, mean; static uint64_t seen, last_ns; static int taken, light;
+    if (limit < 0) { const char *e = getenv("TOTK_PASS_GPU_AUTO"); limit = e ? atof(e) : TARGET_OS_IPHONE ? 20 : 0; if (!(limit > 0)) limit = 0; }
+    if (!limit || taken >= 20) return;
+    mean += (g - mean) / 48;
+    if (++seen < 600) return;
+    uint64_t now = now_ns();
+    if (last_ns && now - last_ns < 30000000000ull) return;
+    int heavy = mean > limit, calm = !light && mean < limit * 2 / 3 && mean > limit / 3;   /* in the game, not a menu or the title */
+    if (!heavy && !calm) return;
+    light |= calm; last_ns = now; taken++;
+    LOG("[pass-gpu] auto: GPU %.1f ms a frame (48-frame mean, limit %g)%s; the next 2 frames' encoders follow", mean, limit, heavy ? "" : ", a light stretch to compare with");
+    dm_gfx_set_flag("pass_gpu", 2);
+}
+/* TOTK_GPU_BOOST (default on where the GPU keep-alive spinner is off: Breath of the Wild on iPhone / iPad; =0 off). The M4
+   iPad's GPU can settle at its lowest clock while the game is GPU-bound and behind: at the Temple of Time (2026-10-28) the
+   clock probe read 23% of full clock with GPU 25.5 ms a frame (35-40 fps), and every pass had slowed alike. When the GPU
+   time (a 48-frame mean) passes 90% of the present period, the spinner (nvn_mtl.m keepalive_start) fills the GPU's idle
+   gaps so its clock comes back up; it stops once the mean has stayed under 75% for 120 frames (or after 1,200), and may
+   start again 600 frames later. On the device 600 frames of spinner brought 25.5 ms back to 10.6 ms, and the clock stayed
+   up after it stopped (10.4 ms). */
+int mtl_keepalive_boostable(void);
+static void gpu_boost(double g) {
+    static double mean; static uint64_t frames, calm, rest; static int on;
+    if (!mtl_keepalive_boostable()) return;
+    double period = g_rt_period_ms > 0 ? g_rt_period_ms : 1000.0 / 60;
+    mean += (g - mean) / 48;
+    if (rest) { rest--; return; }
+    if (!on) {
+        if (++frames < 600 || mean <= period * 0.9) return;   /* not in the first frames (title, loading) */
+        on = 1; frames = calm = 0;
+        LOG("[gpu-boost] GPU %.1f ms a frame against a %.1f ms frame: the keep-alive spinner is on until the GPU clock is back up", mean, period);
+        dm_gfx_set_flag("keepalive_us", 1000);
+        return;
+    }
+    frames++; calm = mean < period * 0.75 ? calm + 1 : 0;
+    if (calm < 120 && frames < 1200) return;
+    LOG("[gpu-boost] GPU %.1f ms a frame after %llu frames: the spinner is off again", mean, (unsigned long long)frames);
+    dm_gfx_set_flag("keepalive_us", 0);
+    on = 0; rest = 600; frames = 600;
+}
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     NVN_BLOCKING();
     (void)q; win_t *o = (win_t *)w; o->presents++;
@@ -2897,7 +2949,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         trow(f, "@sub_wall_ms", atomic_exchange(&g_sub_wall_ns, 0) / 1e6); trow(f, "@sub_cpu_ms", atomic_exchange(&g_sub_cpu_ns, 0) / 1e6); trow(f, "@sub_instr", (double)atomic_exchange(&g_sub_instr, 0));
     } else atomic_store(&g_nvn_ns, 0);
     g_acq_wait_ns = g_pq_wait_ns = 0;
-    if (f >= 8) { double g = mtl_gpu_ms(f - 8); if (g >= 0) { tpush(3, g); trow(f - 8, "@gpu_ms", g); g_hr[g_hn++ % HRN] = g; }   // GPU 时间滞后 8 帧取（已完成） | GPU time is taken 8 frames late (already completed)
+    if (f >= 8) { double g = mtl_gpu_ms(f - 8); if (g >= 0) { tpush(3, g); trow(f - 8, "@gpu_ms", g); g_hr[g_hn++ % HRN] = g; pass_gpu_auto(g); gpu_boost(g); }   // GPU 时间滞后 8 帧取（已完成） | GPU time is taken 8 frames late (already completed)
         { lf_rec *r = &g_lf[(f - 8) % LFN];   // 长帧日志（缺省开，DM_LONGFRAME=0 关）：整帧 > 20 ms 或 GPU > 16.7 ms、且明显高于近况，才打一行 | long-frame log (on by default, DM_LONGFRAME=0 turns it off): a line is printed only when the whole frame > 20 ms or GPU > 16.7 ms, and it is clearly above recent conditions
           static int on = -1; if (on < 0) { const char *e = getenv("DM_LONGFRAME"); on = !(e && !strcmp(e, "0")); }
           // 「长」是相对近况说的：稳定跑在 30 帧（菜单 / 无窗口宿主）或持续过载时每帧都 > 20 ms，那不是长帧，不刷屏——要比近 16 帧的滑动均值高出四成才算

@@ -461,30 +461,69 @@ static _Atomic uint64_t g_last_sub_ns;
 static _Atomic int g_ka_target_us = 1000;
 static _Atomic uint64_t g_ka_n, g_ka_us, g_ka_max_us;   // spin kernels completed, their summed / longest GPU time (us)
 void mtl_keepalive_stats(uint64_t v[3]) { v[0] = atomic_load(&g_ka_n); v[1] = atomic_load(&g_ka_us); v[2] = atomic_exchange(&g_ka_max_us, 0); }
+/* TOTK: GPU clock probe (TOTK_GPU_PROBE; default on for Breath of the Wild on iPhone / iPad, where the spinner is off). About
+   once a second, as soon as all of the game's command buffers have completed, the spinner's kernel runs once with a fixed
+   20,000 rounds (about 0.5 ms at the M4's full clock) and its GPU time is kept. Against the fastest run of the session it
+   shows how far the GPU's clock is down: a slow stretch whose passes all slowed by the probe's factor ran at a low clock,
+   while a probe that kept its time means the frames got more work. The 300-frame report logs the runs (hle_nvn.c). */
+static _Atomic uint64_t g_probe_n, g_probe_us, g_probe_min_us = UINT64_MAX, g_probe_max_us, g_probe_best_us = UINT64_MAX;
+static int g_ka_boostable;   /* the spinner's thread runs with the spinner off, for hle_nvn.c's gpu_boost to start (flag keepalive_us) */
+int mtl_keepalive_boostable(void) { return g_ka_boostable; }
+void mtl_gpu_probe_stats(uint64_t v[5]) {
+    v[0] = atomic_load(&g_probe_n); v[1] = atomic_load(&g_probe_us); v[2] = atomic_exchange(&g_probe_min_us, UINT64_MAX);
+    v[3] = atomic_exchange(&g_probe_max_us, 0); v[4] = atomic_load(&g_probe_best_us);
+}
 static void keepalive_start(void) {
-    static int started; const char *e = getenv("TOTK_GPU_KEEPALIVE");
+    static int started; const char *e = getenv("TOTK_GPU_KEEPALIVE"), *pe = getenv("TOTK_GPU_PROBE");
+    int spin = !e || atoi(e), probe = pe && atoi(pe), boost = 0;
 #if defined(GAME_BOTW) && TARGET_OS_IPHONE
     /* Breath of the Wild on iPhone / iPad: off unless TOTK_GPU_KEEPALIVE=1. Its frames leave the GPU mostly idle (p50
        3.7-7 ms at 60 fps on an M4 iPad), so the spinner ran ~10 kernels a frame (up to 4.35 ms each, delaying the game's
-       own command buffers) for heat the frame rate does not need. */
-    if (!e || !atoi(e)) return;
+       own command buffers) for heat the frame rate does not need. The clock probe stays on, and the spinner runs only while
+       hle_nvn.c's gpu_boost asks for it (the GPU stuck at a low clock while frames are late; TOTK_GPU_BOOST=0 never). */
+    spin = e && atoi(e); probe = !pe || atoi(pe); boost = 1;
 #endif
-    if (started || (e && !atoi(e)) || nogpu() || getenv("TOTK_HEADLESS")) return; started = 1;   // not in standalone probes
+    { const char *be = getenv("TOTK_GPU_BOOST"); boost = !spin && (be ? atoi(be) != 0 : boost); }   /* Mac tests: TOTK_GPU_KEEPALIVE=0 TOTK_GPU_BOOST=1 */
+    if (started || (!spin && !probe && !boost) || nogpu() || getenv("TOTK_HEADLESS")) return; started = 1;   // not in standalone probes
     NSError *err = nil;
     id<MTLLibrary> lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nkernel void keep(device float *a [[buffer(0)]], constant uint &n [[buffer(1)]], uint i [[thread_position_in_grid]]) { float x = a[i]; for (uint j = 0; j < n; j++) x = fma(x, 1.0000001f, 0.5f); a[i] = x; }\n" options:nil error:&err];
     id<MTLComputePipelineState> ps = lib ? [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"keep"] error:&err] : nil;
     id<MTLCommandQueue> q = [g_dev newCommandQueue]; id<MTLBuffer> buf = [g_dev newBufferWithLength:4096 options:MTLResourceStorageModePrivate];
     if (!ps || !q || !buf) { MLOG("【红】TOTK_GPU_KEEPALIVE：建不出自旋核 %s", err.localizedDescription.UTF8String); return; }
     { const char *us = getenv("TOTK_GPU_KEEPALIVE_US"); int v = us ? atoi(us) : 0; if (v >= 100 && v <= 1000) atomic_store(&g_ka_target_us, v); }   /* like flag keepalive_us, from the start */
-    MLOG("GPU 保活：独立队列上持续跑短自旋核（每个约 %d µs），避免 GPU 在帧间空闲时降频（TOTK_GPU_KEEPALIVE=0 关闭）", atomic_load(&g_ka_target_us));
-    g_ka_idle = dispatch_semaphore_create(0);
+    if (!spin) atomic_store(&g_ka_target_us, 0);
+    if (spin) MLOG("GPU 保活：独立队列上持续跑短自旋核（每个约 %d µs），避免 GPU 在帧间空闲时降频（TOTK_GPU_KEEPALIVE=0 关闭）", atomic_load(&g_ka_target_us));
+    if (probe) MLOG("GPU clock probe: a fixed 20,000-round kernel about once a second at the end of the game's GPU work (TOTK_GPU_PROBE=0 off)");
+    g_ka_idle = dispatch_semaphore_create(0); g_ka_boostable = boost;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         __block uint32_t n = 40000; dispatch_semaphore_t sem = dispatch_semaphore_create(1);   // ~1 ms on the M4 at full clock
+        uint64_t next_probe = 0;
         for (;;) @autoreleasepool {
+            uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), last = atomic_load(&g_last_sub_ns);
+            if (!last || now - last > 100000000ull) { usleep(10000); continue; }   // the game is not rendering
+            if (probe && now >= next_probe) {   // the clock probe, right after the game's command buffers complete
+                while (!dispatch_semaphore_wait(g_ka_idle, DISPATCH_TIME_NOW)) {}
+                if (atomic_load(&g_q4_inflight) > 0) dispatch_semaphore_wait(g_ka_idle, dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC));
+                if (atomic_load(&g_q4_inflight) > 0) continue;
+                dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+                uint32_t iters = 20000;
+                id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                [ce setComputePipelineState:ps]; [ce setBuffer:buf offset:0 atIndex:0]; [ce setBytes:&iters length:4 atIndex:1];
+                [ce dispatchThreads:MTLSizeMake(32, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; [ce endEncoding];
+                [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { uint64_t us = (uint64_t)((c.GPUEndTime - c.GPUStartTime) * 1e6);
+                    if (!atomic_fetch_add(&g_probe_n, 1)) MLOG("GPU clock probe: first run %.3f ms", us / 1e3);
+                    atomic_fetch_add(&g_probe_us, us);
+                    uint64_t v = atomic_load(&g_probe_min_us); while (us < v && !atomic_compare_exchange_weak(&g_probe_min_us, &v, us)) {}
+                    v = atomic_load(&g_probe_max_us); while (us > v && !atomic_compare_exchange_weak(&g_probe_max_us, &v, us)) {}
+                    v = atomic_load(&g_probe_best_us); while (us < v && !atomic_compare_exchange_weak(&g_probe_best_us, &v, us)) {}
+                    dispatch_semaphore_signal(sem); }];
+                bg_gate();
+                [cb commit];
+                next_probe = now + 1000000000ull;
+                continue;
+            }
             int target_us = atomic_load(&g_ka_target_us);
             if (!target_us) { usleep(2000); continue; }
-            uint64_t last = atomic_load(&g_last_sub_ns);
-            if (!last || clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - last > 100000000ull) { usleep(10000); continue; }   // the game is not rendering
             if (atomic_load(&g_q4_inflight) > 0) { dispatch_semaphore_wait(g_ka_idle, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_MSEC)); continue; }   // the game's own GPU work keeps the clock up
             dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
             if (atomic_load(&g_q4_inflight) > 0) { dispatch_semaphore_signal(sem); continue; }

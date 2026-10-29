@@ -63,3 +63,70 @@ without sampling it, so the pass is stored before the pond water. Cost, Mac with
 frames that draw pond water (the waterfall rim, Dueling Peaks Stable, the shop save), none in the three saves without
 it; GPU p50 +0.37 ms at the rim (7.02 → 7.39, now including the water itself), unchanged at the stable (6.66 → 6.65).
 `TOTK_ATT_STORE_PER_ATT=0` turns the new part off for A/B.
+
+## BotW Temple of Time on the M4 iPad (2026-10-27)
+
+The owner's iPad log (native 1440p, Match display, 3D 75%, 60 fps cap, thermal state nominal, CPU at 3.86 GHz) had
+about a minute at the Temple of Time with GPU p50 21–28 ms (35–40 fps) while the submit thread stayed at ~8 ms: GPU-bound,
+not throttled. Before and after, the same area ran at 9–14 ms. Draws per frame were lower in that minute (3,900–4,400)
+than just before (4,600–5,200); render passes were higher (153–170 against 137–147).
+
+The Mac (M4 Pro, 16-core GPU) does not reproduce it with the same save, mods and settings: 4.5–5.6 ms everywhere in the
+temple (six camera directions, a walk through the hall and up the stairs, twelve in-game hours facing the statue). There
+the frame is ~183 encoders, 129 of them under 0.02 ms; passes at the 3D resolution are ~40% of the GPU time, and a few
+single-draw passes on tiny targets (20×13, 40×27, 80×55) take 0.3–0.65 ms each whatever the resolution. 3D at 50%
+instead of 75% (0.44× the pixels) only saved 20% (5.3 → 4.3 ms): in this place a dynamic resolution would not hold
+60 fps. The game has one (main+0x17ef9f0, scales 0.9 / 0.8), but it reacts to GPU time over 180% / 280% of a 60 Hz frame
+(a 30 fps target) and the port's counter timestamps are written at command-buffer completion, so it never acts.
+
+Differences on the iPad side at that time: memory footprint 4.0–4.4 GB against 3.3 GB on the Mac, the residency set
+3,800 allocations against 1,950, 61,000 destroyed textures kept for recording copies, and a DualSense Edge paired 30 s
+before (the app was in the background 64 s). `TOTK_PASS_GPU_AUTO` (default 20 ms on iPhone / iPad, `hle_nvn.c`) now logs
+the per-encoder GPU profile of two frames when the GPU time stays over budget, plus one light stretch to compare with;
+the next session there names the passes that grow.
+
+### The owner's second session there (2026-10-28)
+
+The automatic profile caught it: frames 7,800–9,300 at GPU p50 24–27 ms (about 4,200 draws a frame) right after
+6,600–7,500 at 9.6–10 ms (about 5,000 draws). The 10-27 log has the same shape (5,000 draws at 9.7 ms, then 4,000 at
+21–26 ms). Per pass, compared with the light profile taken just after the save loaded (frame 807, where in the world is not
+logged) and with the Mac facing the statue:
+
+| Pass (first shader, target) | iPad, light (frame 807) | iPad, slow (7620) | Mac (M4 Pro) |
+|---|---|---|---|
+| G-buffer `0be4e378`, 1920×1323, ~2,000 draws | 1.21 ms | 5.49 ms | 0.69 ms |
+| `1b7a33a8`, 10 draws | 0.93 | 2.59 | 0.39 |
+| `2b8863c5`, ~200 draws | 0.41 | 1.81 | 0.19 |
+| `119f184b`, ~80 draws | 0.15 | 1.16 | 0.12 |
+| FXAA `bd7ffdd4`, 2560×1764 | 0.73 | 1.32 | 0.18 |
+
+Every pass slowed by a similar factor (3–8x against the iPad's own light frame), with nominal thermal state, the
+submit thread at 3.87 GHz, 2 GB of memory still available and no change in draws that would explain it. That looks
+like the GPU running at a low clock rather than one costly effect. The renderer's own notes already say the M4 GPU
+drops its clock when it idles part of each frame (the keep-alive spinner, `nvn_mtl.m` keepalive_start, which is off for
+BotW on the iPad), and its notes record kernels sized for 1 ms taking up to 4.35 ms in those gaps on the iPad. On the Mac, with the
+spinner off, the probe below reads 85–91% of full clock at the statue and 100% with it on (game GPU 5.5 → 5.2 ms).
+
+The GPU clock probe (`TOTK_GPU_PROBE`, on by default on the iPad; Mac `TOTK_GPU_PROBE=1`) runs about once a second,
+right after the game's command buffers complete: one fixed kernel (20,000 rounds; 0.255 ms on the M4 Pro and 0.273 ms
+on the M4 iPad at full clock). Every 300 frames the log says `GPU clock probe to frame N: ... the clock was about X% of
+that`.
+
+### Result and fix (third session, 2026-10-28)
+
+The owner played at the temple until it slowed. The probe settled it:
+
+| Stretch | GPU per frame | Probe (clock) |
+|---|---|---|
+| normal play | ~10 ms | 0.27–0.33 ms (83–99%) |
+| slow, frames 2,700–3,300 | 26.8 ms | 1.19 ms (23%: the lowest clock, as on the title screen) |
+| keep-alive spinner on, 600 frames | 10.6 ms | 91–99% |
+| spinner off again, rest of the session (12,000 frames) | 10.0–10.8 ms | mostly 77–99% (65% once) |
+
+So the iPad's GPU got stuck at its lowest clock while the game was GPU-bound and behind, and keeping it busy in the
+gaps between frames for a few seconds brought it back for good. `gpu_boost` (`hle_nvn.c`, `TOTK_GPU_BOOST=0` off; on
+by default where the spinner is off, i.e. BotW on iPhone / iPad) now does that by itself: when the GPU time (48-frame
+mean) passes 90% of the present period, the spinner runs until the mean has stayed under 75% for 120 frames (at most
+1,200 frames), then rests 600 frames. The log says `[gpu-boost] ... the keep-alive spinner is on` / `... off again`. At
+60 fps and ~10 ms normal GPU time it never runs in ordinary play. On the Mac (`TOTK_GPU_KEEPALIVE=0 TOTK_GPU_BOOST=1`,
+a 4K canvas to force the GPU over budget) it cycled on 1,200 / off 600 as designed.
