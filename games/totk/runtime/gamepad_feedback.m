@@ -1,5 +1,7 @@
-/* The Mac controller's haptics and motion sensors for the game's HD rumble and six-axis sensor (runtime/hid_feedback.c),
-   2026-10-17. On by default (TOTK_RUMBLE=0 / TOTK_GYRO=0 turn them off), and only on macOS (iOS: stubs, never on).
+/* The controller's haptics and motion sensors for the game's HD rumble and six-axis sensor (runtime/hid_feedback.c),
+   2026-10-17. On by default (TOTK_RUMBLE=0 / TOTK_GYRO=0 turn them off). Rumble on macOS only (iOS: stubs); motion on
+   both since 2026-10-27 (iPadOS gives GCMotion for the DualSense, DualShock 4 and Switch controllers just as macOS does),
+   except the Switch Pro HID fallback below, which needs IOKit.
    Rumble: each of the game's two vibration devices (left, right) is a Core Haptics engine on that handle of the
    controller (GCHapticsLocalityLeftHandle / RightHandle; a DualSense has both) playing a long continuous event. The
    game's value (two bands, each an amplitude 0..1 at a frequency) sets the event's intensity (TOTK_RUMBLE_GAIN, default 1,
@@ -21,8 +23,6 @@
 #include "runtime.h"
 
 #if !TARGET_OS_OSX
-void runtime_feedback_attach(GCController *c) { (void)c; }
-void runtime_feedback_detach(GCController *c) { (void)c; }
 void runtime_feedback_quiet(void) {}
 void runtime_rumble_set(unsigned side, float al, float fl, float ah, float fh) { (void)side; (void)al; (void)fl; (void)ah; (void)fh; }
 #else
@@ -162,6 +162,7 @@ static void rumble_start(void) {
         dispatch_resume(rumbleTimer);
     });
 }
+#endif
 
 /* ---- motion: the math is in runtime/motion_fusion.c ---- */
 static GCController *motionPad;  /* main queue */
@@ -177,7 +178,7 @@ static void motion_sample(GCMotion *m) {   /* the controller's handler queue */
         if (!acc[0] && !acc[1] && !acc[2] && !gyro[0] && !gyro[1] && !gyro[2]) {
             uint64_t now = runtime_now_ns();
             if (!zeroSince) zeroSince = now;
-            else if (!hidAsked && now - zeroSince > 1000000000ull) { hidAsked = YES; dispatch_async(dispatch_get_main_queue(), ^{ hid_motion_start(); }); }
+            else if (!hidAsked && now - zeroSince > 1000000000ull) { hidAsked = YES; dispatch_async(dispatch_get_main_queue(), ^{ hid_motion_start(); }); }   /* iOS: logs it */
             return;
         }
         motionSeen = YES;
@@ -196,6 +197,12 @@ static void motion_sample(GCMotion *m) {   /* the controller's handler queue */
    calibration (the user calibration at 0x8026 when it has its 0xB2A1 magic, else the factory one at 0x6020), as SDL:
    G = raw * 4 / (sensitivity - origin), deg/s = (raw - origin) * 936 / (sensitivity - origin); until it arrives the
    sensor's nominal ranges, 8 G and 2000 deg/s over 32768. */
+#if !TARGET_OS_OSX
+static void hid_motion_start(void) {
+    fprintf(stderr, "[gyro] %s: GameController's motion is all zeros: no motion from it\n", (motionPad.vendorName ?: @"controller").UTF8String);
+}
+static void hid_motion_stop(void) {}
+#else
 #import <IOKit/hid/IOHIDManager.h>
 static IOHIDManagerRef hidManager;   /* main queue */
 static IOHIDDeviceRef hidDevice;     /* main queue */
@@ -278,10 +285,12 @@ static void hid_motion_stop(void) {   /* main queue */
     CFRelease(hidDevice); hidDevice = NULL;
     CFRelease(hidManager); hidManager = NULL;
 }
+#endif
 
 /* ---- controllers ---- */
 void runtime_feedback_attach(GCController *c) {   /* main queue */
     const char *name = (c.vendorName ?: @"controller").UTF8String;
+#if TARGET_OS_OSX
     if (runtime_rumble_enabled()) {
         rumble_start();
         if (c.haptics) {
@@ -290,6 +299,7 @@ void runtime_feedback_attach(GCController *c) {   /* main queue */
             fprintf(stderr, "[rumble] %s: haptics (%s)\n", name, [where componentsJoinedByString:@", "].UTF8String);
         } else fprintf(stderr, "[rumble] %s has no haptics: no rumble from it\n", name);
     }
+#endif
     if (runtime_gyro_enabled()) {
         static dispatch_once_t once;
         dispatch_once(&once, ^{
@@ -307,10 +317,11 @@ void runtime_feedback_attach(GCController *c) {   /* main queue */
     }
 }
 void runtime_feedback_detach(GCController *c) {   /* main queue */
+#if TARGET_OS_OSX
     if (runtime_rumble_enabled() && rumbleQueue)
         dispatch_async(rumbleQueue, ^{ if (rumblePad == c) { for (int s = 0; s < 2; s++) forget_side(s); rumblePad = nil; } });
+#endif
     if (motionPad == c) {
         c.motion.valueChangedHandler = nil; hid_motion_stop(); motionPad = nil; runtime_motion_live(0);
     }
 }
-#endif
