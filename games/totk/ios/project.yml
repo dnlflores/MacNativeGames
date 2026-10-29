@@ -19,6 +19,7 @@ targets:
           - game_patches_botw.c
           - botw_cheats.c
           - botw_item_list.c
+          - botw_button_icons.c
       - path: ../third_party/d2r_gfx/gfx/nvn
       - path: ../third_party/d2r_gfx/gfx/tex
       - path: Gen/embed.S

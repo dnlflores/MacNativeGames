@@ -171,6 +171,22 @@ static void controls_save(const uint16_t map[CONTROLLER_BUTTONS], const uint8_t 
     if (n) [t writeToFile:controls_path() atomically:YES encoding:NSUTF8StringEncoding error:nil];
     else [fm() removeItemAtPath:controls_path() error:nil];
 }
+/* Breath of the Wild's button prompts (runtime/botw_button_icons.c): the game's own Switch buttons, or PlayStation symbols
+   for the same buttons. */
+static NSArray<NSArray<NSString *> *> *button_icon_options(void) {
+    return @[@[@"nintendo", @"Nintendo (A B X Y)", @"The game's own Switch buttons."],
+             @[@"playstation", @"PlayStation (○ ✕ △ □)", @"Each prompt shows the PlayStation button that does it: ○ ✕ △ □, L1 R1 L2 R2, Options, Create and a cross-shaped D-pad."]];
+}
+static NSString *button_icons(void) { return [str(@"buttonIcons", @"nintendo") isEqualToString:@"playstation"] ? @"playstation" : @"nintendo"; }
+/* TOTK_BUTTON_ICONS for PlayStation prompts: "playstation", plus the symbol of the face button each of A, B, X and Y is on
+   when the layout moves them (x o s t: bottom, right, left, top), so the prompt names the button that does it. */
+static NSString *playstation_icons(void) {
+    uint16_t map[CONTROLLER_BUTTONS]; uint8_t modes[CONTROLLER_BUTTONS]; controls_load(map, modes);
+    char sym[5] = "oxts"; const char phys[4] = {'x', 'o', 's', 't'};   // kPhysicalTitles order
+    BOOL moved = NO;
+    for (int b = 0; b < 4; b++) for (int i = 0; i < 4; i++) if (map[i] == 1u << b) { moved |= sym[b] != phys[i]; sym[b] = phys[i]; break; }
+    return moved ? [NSString stringWithFormat:@"playstation:%s", sym] : @"playstation";
+}
 
 // ---------- saves ----------
 static NSString *saves_root(void) { return [docs() stringByAppendingPathComponent:@"save/save"]; }
@@ -577,6 +593,7 @@ NSString *totk_launcher_apply(void) {
         if (line) return [NSString stringWithFormat:@"controls.txt line %d: %s. Fix it in the Files app, or reset the layout in Controls.", line, error];
         setenv("TOTK_CONTROLS", controls_path().fileSystemRepresentation, 0);
     }
+    if (kBotW && [button_icons() isEqualToString:@"playstation"]) setenv("TOTK_BUTTON_ICONS", playstation_icons().UTF8String, 0);
     if (g_mods_active) setenv("TOTK_ROMFS_MODS", mods_active_dir().fileSystemRepresentation, 0);
     if (g_aoc_mods_active) setenv("TOTK_AOC_MODS", [docs() stringByAppendingPathComponent:@".mods-active-aoc"].fileSystemRepresentation, 0);
     if (kBotW) for (NSString *c in cheats()) setenv(c.UTF8String, "1", 0);
@@ -584,6 +601,7 @@ NSString *totk_launcher_apply(void) {
     fprintf(stderr, "[launcher] graphics %s, 3D %s%%, fps counter %d, frame rate %s, frame generation %s, aniso %s, full textures %d, audio %s, controls %s, mods %s\n",
             g.UTF8String, kBotW && docked ? render_scale().UTF8String : "100", flag(@"fpsCounter", YES), cap.UTF8String, kBotW ? "n/a" : str(@"frameGen", @"off").UTF8String, aniso.UTF8String, flag(@"fullTextures", NO),
             str(@"audioBuffer", @"normal").UTF8String, text ? "custom" : "default", g_mods_active ? "on" : "none");
+    if (kBotW) fprintf(stderr, "[launcher] button icons %s\n", getenv("TOTK_BUTTON_ICONS") ?: "nintendo");
     return nil;
 }
 
@@ -949,6 +967,14 @@ static TLForm *button_form(int physical) {
 static TLForm *controls_form(void) {
     return [[TLForm alloc] initWithTitle:@"Controls" build:^NSArray<TLSection *> *(TLForm *me) {
         uint16_t map[CONTROLLER_BUTTONS]; uint8_t modes[CONTROLLER_BUTTONS]; controls_load(map, modes);
+        NSMutableArray *sections = [NSMutableArray array];
+        if (kBotW) {
+            TLSection *icons = section(@"Prompts", @"The buttons the game's prompts show. Applies the next time the game starts.");
+            TLRow *r = row(@"Button icons", option_title(button_icon_options(), button_icons())); r.disclosure = YES;
+            r.tapped = ^{ push_choice(me, @"Button icons", @"PlayStation symbols follow the layout below: with the default, ○ (right) is A, ✕ (bottom) B, △ (top) X and □ (left) Y.",
+                                      button_icon_options(), button_icons(), ^(NSString *v) { [defs() setObject:v forKey:@"buttonIcons"]; }); };
+            [icons.rows addObject:r]; [sections addObject:icons];
+        }
         TLSection *pre = section(@"Layouts", @"The default matches the Switch by position: the right face button is A, the bottom one B, on any controller.");
         TLRow *def = row(@"Switch layout by position (default)", nil); def.tapped = ^{ [fm() removeItemAtPath:controls_path() error:nil]; [me reload]; };
         TLRow *xbox = row(@"Xbox-style labels", @"Bottom face button is A, right is B, left X, top Y");
@@ -966,7 +992,8 @@ static TLForm *controls_form(void) {
             r.tapped = ^{ [me.navigationController pushViewController:button_form(i) animated:YES]; };
             [btn.rows addObject:r];
         }
-        return @[pre, btn];
+        [sections addObjectsFromArray:@[pre, btn]];
+        return sections;
     }];
 }
 /* The options of a BCML package: one section per group; an exclusive group is a choice of one (none allowed unless
@@ -1197,7 +1224,8 @@ static UIColor *gold(void) { return [UIColor colorWithRed:0.89 green:0.76 blue:0
     NSArray *base = @[
         @[@"display", @"Graphics", option_title(resolution_options(), graphics_choice())],
         @[@"sparkles", @"Enhancements", enh ? [NSString stringWithFormat:@"%d changed", enh] : @"Default"],
-        @[@"gamecontroller", @"Controls", changed ? [NSString stringWithFormat:@"Custom layout · %d button%@ changed", changed, changed == 1 ? @"" : @"s"] : @"Default layout"],
+        @[@"gamecontroller", @"Controls", [(changed ? [NSString stringWithFormat:@"Custom layout · %d button%@ changed", changed, changed == 1 ? @"" : @"s"] : @"Default layout")
+                                             stringByAppendingString:kBotW && [button_icons() isEqualToString:@"playstation"] ? @" · PlayStation icons" : @""]],
         @[@"puzzlepiece.extension", @"Mods", mods ? [NSString stringWithFormat:@"%lu on", (unsigned long)mods] : (installed_mods().count ? @"All off" : @"None installed")],
         @[@"externaldrive", @"Saves", slots ? [NSString stringWithFormat:@"%lu slot%@ · saved %@", (unsigned long)slots, slots == 1 ? @"" : @"s", ago(latest)] : @"No saves yet"],
     ];

@@ -61,7 +61,7 @@ def main():
     project=(ios/'project.yml').read_text()
     if botw:   # game_patches_botw.c replaces both of Tears of the Kingdom's (games/totk/Makefile runtime-botw160)
         project=project.replace('          - game_patches_botw.c','          - game_patches.c\n          - game_patches_v143.c')
-        project=project.replace('          - botw_cheats.c\n          - botw_item_list.c\n','')   # the in-game cheat menu is Breath of the Wild's
+        project=project.replace('          - botw_cheats.c\n          - botw_item_list.c\n          - botw_button_icons.c\n','')   # the cheat menu and the PlayStation button icons are Breath of the Wild's
         project=project.replace('-I../build\n','-I../build -DGAME_BOTW=1 -DGAME_BOTW160=1\n')
     elif a.version=='v143': project=project.replace('          - loader.c','          - loader.c\n          - game_patches.c')
     else: project=project.replace('          - loader.c','          - loader.c\n          - game_patches_v143.c')

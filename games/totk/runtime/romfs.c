@@ -5,6 +5,9 @@
 #include "game_version.h"
 #include "fs_host.h"
 #include "romfs_path.h"
+#ifdef GAME_BOTW
+#include "botw_button_icons.h"
+#endif
 #include <CommonCrypto/CommonDigest.h>
 #include <TargetConditionals.h>
 #include <fcntl.h>
@@ -62,6 +65,13 @@ static char **added;       /* RomFS paths of the added files, sorted; added[k] i
 static size_t nadded;
 static uint32_t handle_ovl[NH]; /* overlay slot + 1 of an open handle, 0 = original */
 static int handle_fd[NH];       /* the handle's open overlay file, when handle_ovl is set */
+/* Files rewritten when the game opens them (Breath of the Wild: the font packs with PlayStation button glyphs,
+   botw_button_icons.c): made once from the original or its overlay, then served from memory. Append-only. */
+typedef struct { uint64_t index,size; uint8_t *data; } Generated;
+static Generated generated[16];
+static unsigned ngenerated;
+static pthread_mutex_t generated_lock=PTHREAD_MUTEX_INITIALIZER;
+static uint32_t handle_gen[NH]; /* generated slot + 1 of an open handle, 0 = none */
 typedef struct { uint64_t offset,size;uint32_t name,len; } Entry;
 _Static_assert(sizeof(Entry)==24,"index entry layout");
 static Entry entry(uint64_t i) {Entry e;memcpy(&e,index_bytes+24+i*24,24);return e;}
@@ -278,6 +288,27 @@ static unsigned cache_size(uint64_t *out) {if(!out)return INVALID;*out=0;return 
 static char text_lang[5];
 static void fs_log(const char *what,const char *path){static int on=-1;static uint64_t t0;if(on<0){on=getenv("TOTK_FS_LOG")!=NULL;t0=runtime_now_ns();}if(on)fprintf(stderr,"[totk-fs] %8.3f %s %s\n",(runtime_now_ns()-t0)/1e9,what,path);}
 void runtime_fs_log(const char *what,const char *path){fs_log(what,path);}
+#ifdef GAME_BOTW
+/* The generated slot + 1 for RomFS file i (path p), made on its first open from the overlay file fd (slot ov) or the
+   original; 0 when the file is served as it is (a failure is logged once and keeps the original). */
+static uint32_t generated_slot(uint64_t i,const char *p,uint32_t ov,int fd) {
+ if(!botw_button_icons_wanted(p))return 0;
+ pthread_mutex_lock(&generated_lock);
+ for(unsigned k=0;k<ngenerated;k++)if(generated[k].index==i){uint32_t slot=generated[k].data?k+1:0;pthread_mutex_unlock(&generated_lock);return slot;}
+ uint64_t size=ov?overlays[ov-1].size:entry(i).size,done=0;uint8_t *src=malloc(size?size:1),*made=NULL;size_t made_size=0;char error[200]="out of memory";
+ if(src){
+  while(done<size){ssize_t r=ov?pread(fd,src+done,(size_t)(size-done),(off_t)done):src_pread(image_fd,src+done,(size_t)(size-done),(off_t)(entry(i).offset+done));if(r<=0)break;done+=(uint64_t)r;}
+  if(done==size)made=botw_button_icons_pack(src,(size_t)size,&made_size,error,sizeof(error));else snprintf(error,sizeof(error),"read failed");
+  free(src);}
+ if(ngenerated<sizeof(generated)/sizeof(generated[0]))generated[ngenerated++]=(Generated){i,made_size,made};else{free(made);made=NULL;}
+ fprintf(stderr,"[totk] button icons: %s %s\n",p,made?"drawn as PlayStation buttons":error);
+ uint32_t slot=made?ngenerated:0;pthread_mutex_unlock(&generated_lock);return slot;
+}
+#else
+static uint32_t generated_slot(uint64_t i,const char *p,uint32_t ov,int fd) {(void)i;(void)p;(void)ov;(void)fd;return 0;}
+#endif
+/* The generated slot + 1 an open handle reads from, or 0. */
+static uint32_t handle_generated(uint64_t h) {pthread_mutex_lock(&lock);uint32_t g=handle_gen[h-0x100000000ULL];pthread_mutex_unlock(&lock);return g;}
 unsigned runtime_romfs_open(uint64_t *out,const char *path,int mode) {
  fs_log("rom",path?path:"(null)");
  if(!out||mode!=1)return UNSUPPORTED;const char *p=rom_path(path);if(!p)return NOT_FOUND;uint64_t i=file_index(p);if(i==UINT64_MAX)return NOT_FOUND;
@@ -286,7 +317,8 @@ unsigned runtime_romfs_open(uint64_t *out,const char *path,int mode) {
  if(ov){const Overlay *o=&overlays[ov-1];fd=open(o->path,O_RDONLY|O_CLOEXEC);struct stat st;
   if(fd<0||fstat(fd,&st)!=0||(uint64_t)st.st_size!=o->size||st.st_dev!=o->dev||st.st_ino!=o->ino||st.st_mtimespec.tv_sec!=o->mtime.tv_sec||st.st_mtimespec.tv_nsec!=o->mtime.tv_nsec){
    fprintf(stderr,"[totk] RomFS overlay: %s is missing or changed since the start check\n",o->path);runtime_fail("RomFS overlay file changed while the game ran (restart the game)");}}
- pthread_mutex_lock(&lock);for(unsigned j=1;j<NH;j++)if(!handles[j]){handles[j]=i+1;handle_ovl[j]=ov;handle_fd[j]=fd;*out=0x100000000ULL+j;pthread_mutex_unlock(&lock);return 0;}pthread_mutex_unlock(&lock);runtime_fail("file handle table full");return INVALID;
+ uint32_t gen=generated_slot(i,p,ov,fd);
+ pthread_mutex_lock(&lock);for(unsigned j=1;j<NH;j++)if(!handles[j]){handles[j]=i+1;handle_ovl[j]=ov;handle_fd[j]=fd;handle_gen[j]=gen;*out=0x100000000ULL+j;pthread_mutex_unlock(&lock);return 0;}pthread_mutex_unlock(&lock);runtime_fail("file handle table full");return INVALID;
 }
 static int handle_entry(uint64_t h,Entry *e) {if(h<=0x100000000ULL||h>=0x100000000ULL+NH)return 0;pthread_mutex_lock(&lock);uint64_t i=handles[h-0x100000000ULL];pthread_mutex_unlock(&lock);if(!i)return 0;*e=i-1<file_count?entry(i-1):(Entry){0};return 1;}   /* an added file's bytes are all in its overlay */
 /* Where an open handle's bytes come from: the overlay file, or the original's range of the image. */
@@ -295,7 +327,10 @@ static void handle_source(uint64_t h,const Entry *e,int *fd,uint64_t *base,uint6
  if(ov){*fd=ofd;*base=0;*size=overlays[ov-1].size;}else{*fd=image_fd;*base=e->offset;*size=e->size;}
 }
 unsigned runtime_romfs_read(uint64_t *out,uint64_t h,int64_t offset,void *buffer,uint64_t size) {
- Entry e;if(!out||offset<0||!handle_entry(h,&e))return INVALID;int fd;uint64_t base,fsize;handle_source(h,&e,&fd,&base,&fsize);if((uint64_t)offset>fsize||(!buffer&&size))return INVALID;
+ Entry e;if(!out||offset<0||!handle_entry(h,&e))return INVALID;
+ uint32_t gs=handle_generated(h);
+ if(gs){const Generated *g=&generated[gs-1];if((uint64_t)offset>g->size||(!buffer&&size))return INVALID;
+  uint64_t n=size;if(n>g->size-(uint64_t)offset)n=g->size-(uint64_t)offset;dm_guest_write_prepare(buffer,(size_t)n);memcpy(buffer,g->data+offset,(size_t)n);*out=n;return 0;}int fd;uint64_t base,fsize;handle_source(h,&e,&fd,&base,&fsize);if((uint64_t)offset>fsize||(!buffer&&size))return INVALID;
  uint64_t n=size;if(n>fsize-(uint64_t)offset)n=fsize-(uint64_t)offset;uint64_t done=0;
  static _Atomic int profile_mode=-1;int profile=atomic_load(&profile_mode);if(profile<0){profile=getenv("TOTK_FS_TIMING")!=NULL;atomic_store(&profile_mode,profile);}uint64_t prep_start=profile?runtime_now_ns():0;
  dm_guest_write_prepare(buffer,(size_t)n);
@@ -309,8 +344,8 @@ unsigned runtime_romfs_read(uint64_t *out,uint64_t h,int64_t offset,void *buffer
     (unsigned long long)atomic_exchange(&read_calls,0),(unsigned long long)atomic_exchange(&read_bytes,0),atomic_exchange(&read_ns,0)/1e6,atomic_exchange(&read_prepare_ns,0)/1e6);}
  *out=done;return 0;
 }
-unsigned runtime_romfs_size(int64_t *out,uint64_t h) {Entry e;if(!out||!handle_entry(h,&e))return INVALID;int fd;uint64_t base,size;handle_source(h,&e,&fd,&base,&size);*out=(int64_t)size;return 0;}
-void runtime_romfs_close(uint64_t h) {Entry e;if(!handle_entry(h,&e))runtime_fail("close invalid file handle");uint64_t j=h-0x100000000ULL;pthread_mutex_lock(&lock);int fd=handle_ovl[j]?handle_fd[j]:-1;handles[j]=0;handle_ovl[j]=0;handle_fd[j]=-1;pthread_mutex_unlock(&lock);if(fd>=0)close(fd);}
+unsigned runtime_romfs_size(int64_t *out,uint64_t h) {Entry e;if(!out||!handle_entry(h,&e))return INVALID;uint32_t gs=handle_generated(h);if(gs){*out=(int64_t)generated[gs-1].size;return 0;}int fd;uint64_t base,size;handle_source(h,&e,&fd,&base,&size);*out=(int64_t)size;return 0;}
+void runtime_romfs_close(uint64_t h) {Entry e;if(!handle_entry(h,&e))runtime_fail("close invalid file handle");uint64_t j=h-0x100000000ULL;pthread_mutex_lock(&lock);int fd=handle_ovl[j]?handle_fd[j]:-1;handles[j]=0;handle_ovl[j]=0;handle_fd[j]=-1;handle_gen[j]=0;pthread_mutex_unlock(&lock);if(fd>=0)close(fd);}
 unsigned runtime_romfs_entry_type(int *out,const char *path) {
  if(!out)return INVALID;const char *p=rom_path(path);if(!p)return NOT_FOUND;if(file_index(p)!=UINT64_MAX){*out=1;return 0;}
  char dir[4096];if(snprintf(dir,sizeof(dir),"%s/",p)>=(int)sizeof(dir))return INVALID;if(folder_exists(dir)){*out=0;return 0;}return NOT_FOUND;
